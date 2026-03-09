@@ -1,0 +1,8 @@
+node_modules
+dist
+.env
+*.local
+
+# Personal profile — contains your real resume data. Never commit this.
+# Copy profile.example.ts → profile.ts and fill in your own details.
+src/lib/profile.ts
