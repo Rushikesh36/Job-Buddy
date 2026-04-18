@@ -1,5 +1,6 @@
 import type {
   ConversationSnapshot,
+  MemoryBackupPayload,
   Memory,
   MemorySettings,
   MemoryStore,
@@ -11,6 +12,10 @@ import { DEFAULT_MEMORY_SETTINGS, DEFAULT_MEMORY_STORE } from '../types/memory';
 
 const MEMORY_STORE_KEY = 'memoryStore';
 const MEMORY_SETTINGS_KEY = 'memorySettings';
+const SYNC_MEMORY_STORE_KEY = 'syncMemoryStore';
+const SYNC_MEMORY_SETTINGS_KEY = 'syncMemorySettings';
+const DAILY_BACKUP_KEY = 'memoryDailyBackup';
+const LAST_DAILY_BACKUP_DATE_KEY = 'memoryDailyBackupDate';
 
 const STOP_WORDS = new Set([
   'the', 'a', 'an', 'and', 'or', 'to', 'of', 'for', 'in', 'on', 'with', 'is', 'are', 'be',
@@ -30,22 +35,132 @@ function setStorage(items: Record<string, unknown>): Promise<void> {
   });
 }
 
+function getSyncStorage<T>(keys: string[]): Promise<Record<string, T>> {
+  return new Promise((resolve) => {
+    chrome.storage.sync.get(keys, (result) => resolve(result as Record<string, T>));
+  });
+}
+
+function setSyncStorage(items: Record<string, unknown>): Promise<void> {
+  return new Promise((resolve) => {
+    chrome.storage.sync.set(items, () => resolve());
+  });
+}
+
+function getLocalString(key: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    chrome.storage.local.get([key], (result) => {
+      resolve((result[key] as string) ?? null);
+    });
+  });
+}
+
+function setLocalString(key: string, value: string): Promise<void> {
+  return new Promise((resolve) => {
+    chrome.storage.local.set({ [key]: value }, () => resolve());
+  });
+}
+
 export async function loadMemoryStore(): Promise<MemoryStore> {
   const result = await getStorage<MemoryStore>([MEMORY_STORE_KEY]);
-  return result[MEMORY_STORE_KEY] ?? { ...DEFAULT_MEMORY_STORE };
+  const localStore = result[MEMORY_STORE_KEY];
+  if (localStore) return localStore;
+
+  const syncResult = await getSyncStorage<MemoryStore>([SYNC_MEMORY_STORE_KEY]);
+  const syncStore = syncResult[SYNC_MEMORY_STORE_KEY];
+  if (syncStore) {
+    await saveMemoryStore(syncStore);
+    return syncStore;
+  }
+
+  return { ...DEFAULT_MEMORY_STORE };
 }
 
 export async function saveMemoryStore(store: MemoryStore): Promise<void> {
   await setStorage({ [MEMORY_STORE_KEY]: store });
+  try {
+    await setSyncStorage({ [SYNC_MEMORY_STORE_KEY]: store });
+  } catch {
+    // Ignore sync quota/account issues and keep local storage as the fallback.
+  }
 }
 
 export async function loadMemorySettings(): Promise<MemorySettings> {
   const result = await getStorage<MemorySettings>([MEMORY_SETTINGS_KEY]);
-  return result[MEMORY_SETTINGS_KEY] ?? { ...DEFAULT_MEMORY_SETTINGS };
+  const localSettings = result[MEMORY_SETTINGS_KEY];
+  if (localSettings) return localSettings;
+
+  const syncResult = await getSyncStorage<MemorySettings>([SYNC_MEMORY_SETTINGS_KEY]);
+  const syncSettings = syncResult[SYNC_MEMORY_SETTINGS_KEY];
+  if (syncSettings) {
+    await saveMemorySettings(syncSettings);
+    return syncSettings;
+  }
+
+  return { ...DEFAULT_MEMORY_SETTINGS };
 }
 
 export async function saveMemorySettings(settings: MemorySettings): Promise<void> {
   await setStorage({ [MEMORY_SETTINGS_KEY]: settings });
+  try {
+    await setSyncStorage({ [SYNC_MEMORY_SETTINGS_KEY]: settings });
+  } catch {
+    // Ignore sync quota/account issues and keep local storage as the fallback.
+  }
+}
+
+export function createMemoryBackupPayload(store: MemoryStore, settings: MemorySettings): MemoryBackupPayload {
+  return {
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    store,
+    settings,
+  };
+}
+
+export function stringifyMemoryBackup(payload: MemoryBackupPayload): string {
+  return JSON.stringify(payload, null, 2);
+}
+
+export function parseMemoryBackupPayload(raw: string): MemoryBackupPayload {
+  const parsed = JSON.parse(raw) as Partial<MemoryBackupPayload>;
+
+  if (parsed?.version !== 1 || !parsed.store || !parsed.settings) {
+    throw new Error('Invalid memory backup file.');
+  }
+
+  return {
+    version: 1,
+    exportedAt: typeof parsed.exportedAt === 'string' ? parsed.exportedAt : new Date().toISOString(),
+    store: parsed.store,
+    settings: parsed.settings,
+  };
+}
+
+export async function loadDailyMemoryBackup(): Promise<MemoryBackupPayload | null> {
+  const raw = await getLocalString(DAILY_BACKUP_KEY);
+  if (!raw) return null;
+
+  try {
+    return parseMemoryBackupPayload(raw);
+  } catch {
+    return null;
+  }
+}
+
+export async function saveDailyMemoryBackup(payload: MemoryBackupPayload): Promise<void> {
+  const serialized = stringifyMemoryBackup(payload);
+  await setLocalString(DAILY_BACKUP_KEY, serialized);
+  try {
+    await setSyncStorage({ [DAILY_BACKUP_KEY]: serialized });
+  } catch {
+    // Ignore sync quota/account issues and keep local storage as the fallback.
+  }
+  await setLocalString(LAST_DAILY_BACKUP_DATE_KEY, payload.exportedAt.slice(0, 10));
+}
+
+export async function getLastDailyMemoryBackupDate(): Promise<string | null> {
+  return getLocalString(LAST_DAILY_BACKUP_DATE_KEY);
 }
 
 export function extractKeywords(text: string, topK = 12): string[] {

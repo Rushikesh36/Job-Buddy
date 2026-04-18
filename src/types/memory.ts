@@ -24,6 +24,13 @@ export interface MemoryStore {
   preferences: UserPreference[];
 }
 
+export interface MemoryBackupPayload {
+  version: 1;
+  exportedAt: string;
+  store: MemoryStore;
+  settings: MemorySettings;
+}
+
 export interface MemorySettings {
   autoSummarize: boolean;
   maxMemories: number;

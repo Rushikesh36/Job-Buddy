@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import type { ChangeEvent } from 'react';
 import type {
   ChatMessage,
   PageContext,
@@ -38,13 +39,18 @@ import { buildPreferenceExtractionPrompt } from '../prompts/preference-extractor
 import { buildRecruiterExtractionPrompt, parseRecruiterInfo, buildColdEmailBody } from '../prompts/recruiter-extractor';
 import {
   applyMemoryLimits,
+  createMemoryBackupPayload,
   buildPromptMemoryContext,
   createMemoryRecord,
   estimateMemoryUsageBytes,
+  getLastDailyMemoryBackupDate,
   loadMemorySettings,
+  saveDailyMemoryBackup,
   loadMemoryStore,
   mergePreferences,
   parsePreferenceCandidates,
+  parseMemoryBackupPayload,
+  stringifyMemoryBackup,
   saveMemorySettings,
   saveMemoryStore,
   searchMemories,
@@ -133,6 +139,11 @@ export default function App() {
   const [loadedMemoryCount, setLoadedMemoryCount] = useState(0);
   const [lastPromptMemoryContext, setLastPromptMemoryContext] = useState<PromptMemoryContext | null>(null);
   const [isMemoryBusy, setIsMemoryBusy] = useState(false);
+  const [lastDailyBackupDate, setLastDailyBackupDate] = useState<string | null>(null);
+  const memoryBackupInputRef = useRef<HTMLInputElement>(null);
+  const hasHydratedMemoryRef = useRef(false);
+  const dailyBackupInFlightRef = useRef(false);
+  const lastAutoSavedAssistantIdRef = useRef<string | null>(null);
 
   const streamingMsgIdRef = useRef<string | null>(null);
   // Synchronous guard against double-sends before React re-renders with isLoading:true
@@ -147,6 +158,7 @@ export default function App() {
       loadSheetsConfig(),
       loadMemoryStore(),
       loadMemorySettings(),
+      getLastDailyMemoryBackupDate(),
     ]).then(
       ([
         settings,
@@ -155,6 +167,7 @@ export default function App() {
         storedSheetsConfig,
         storedMemoryStore,
         storedMemorySettings,
+        storedLastDailyBackupDate,
       ]) => {
         setProviderSettings(settings);
         setSettingsTab(settings.selectedProvider);
@@ -166,6 +179,8 @@ export default function App() {
         setSpreadsheetIdInput(storedSheetsConfig.spreadsheetId ?? '');
         setMemoryStore(storedMemoryStore);
         setMemorySettingsState(storedMemorySettings);
+        setLastDailyBackupDate(storedLastDailyBackupDate);
+        hasHydratedMemoryRef.current = true;
         const activeKey = settings.apiKeys[settings.selectedProvider];
         if (!activeKey) setView('settings');
       }
@@ -173,11 +188,62 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!hasHydratedMemoryRef.current) return;
+    if (dailyBackupInFlightRef.current) return;
+
+    let cancelled = false;
+
+    const runDailyBackup = async () => {
+      const today = new Date().toISOString().slice(0, 10);
+      const lastBackupDate = await getLastDailyMemoryBackupDate();
+      if (cancelled || lastBackupDate === today) return;
+
+      dailyBackupInFlightRef.current = true;
+      try {
+        const payload = createMemoryBackupPayload(memoryStore, memorySettings);
+        await saveDailyMemoryBackup(payload);
+        setLastDailyBackupDate(today);
+      } finally {
+        dailyBackupInFlightRef.current = false;
+      }
+    };
+
+    void runDailyBackup();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [memoryStore, memorySettings]);
+
+  useEffect(() => {
     if (!toast) return;
 
     const timeoutId = window.setTimeout(() => setToast(null), 3200);
     return () => window.clearTimeout(timeoutId);
   }, [toast]);
+
+  useEffect(() => {
+    if (!memorySettings.autoSummarize || isLoading || isMemoryBusy || messages.length < 2) return;
+
+    const lastAssistant = [...messages].reverse().find((message) => message.role === 'assistant');
+    if (!lastAssistant || !lastAssistant.content.trim()) return;
+    if (lastAutoSavedAssistantIdRef.current === lastAssistant.id) return;
+
+    let cancelled = false;
+
+    const saveCurrentChat = async () => {
+      await summarizeCurrentConversationToMemory();
+      if (!cancelled) {
+        lastAutoSavedAssistantIdRef.current = lastAssistant.id;
+      }
+    };
+
+    void saveCurrentChat();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isLoading, isMemoryBusy, messages, memorySettings.autoSummarize, summarizeCurrentConversationToMemory]);
 
   useEffect(() => {
     const flags: Record<string, boolean> = {};
@@ -338,13 +404,15 @@ export default function App() {
   }, [memorySettings.autoSummarize, messages, runUtilityPrompt, pageContext, memoryStore, memorySettings]);
 
   const handleStartNewChat = useCallback(async () => {
-    if (messages.length > 1) {
+    const lastAssistant = [...messages].reverse().find((message) => message.role === 'assistant');
+    if (messages.length > 1 && (!memorySettings.autoSummarize || lastAutoSavedAssistantIdRef.current !== lastAssistant?.id)) {
       await summarizeCurrentConversationToMemory();
     }
     setMessages([]);
     setLoadedMemoryCount(0);
     setLastPromptMemoryContext(null);
-  }, [messages.length, summarizeCurrentConversationToMemory]);
+    lastAutoSavedAssistantIdRef.current = null;
+  }, [messages, memorySettings.autoSummarize, summarizeCurrentConversationToMemory]);
 
   const handleSend = useCallback(
     (overrideText?: string) => {
@@ -942,6 +1010,57 @@ export default function App() {
     setMemoryStore(next);
   };
 
+  const handleExportMemoryBackup = useCallback(() => {
+    const payload = createMemoryBackupPayload(memoryStore, memorySettings);
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `jobbuddy-memory-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    setToast({ type: 'success', message: 'Memory backup exported.' });
+  }, [memoryStore, memorySettings]);
+
+  const handleImportMemoryBackup = useCallback(() => {
+    memoryBackupInputRef.current?.click();
+  }, []);
+
+  const handleCopyMemoryBackup = useCallback(async () => {
+    try {
+      const payload = createMemoryBackupPayload(memoryStore, memorySettings);
+      await navigator.clipboard.writeText(stringifyMemoryBackup(payload));
+      setToast({ type: 'success', message: 'Memory backup copied to clipboard.' });
+    } catch {
+      setToast({ type: 'error', message: 'Could not copy the memory backup.' });
+    }
+  }, [memoryStore, memorySettings]);
+
+  const handleMemoryBackupFileChange = useCallback(
+    async (event: ChangeEvent<HTMLInputElement>) => {
+      const file = event.target.files?.[0];
+      event.target.value = '';
+      if (!file) return;
+
+      try {
+        const raw = await file.text();
+        const backup = parseMemoryBackupPayload(raw);
+
+        await saveMemoryStore(backup.store);
+        await saveMemorySettings(backup.settings);
+        setLastDailyBackupDate(backup.exportedAt.slice(0, 10));
+
+        setMemoryStore(backup.store);
+        setMemorySettingsState(backup.settings);
+        setToast({ type: 'success', message: 'Memory backup restored.' });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to restore memory backup.';
+        setToast({ type: 'error', message });
+      }
+    },
+    []
+  );
+
   // ── derive active provider info ──
   const activeMeta = PROVIDER_META[providerSettings.selectedProvider];
   const activeModel = providerSettings.selectedModels[providerSettings.selectedProvider];
@@ -1409,6 +1528,18 @@ export default function App() {
           onClearAll={() => void handleClearAllMemories()}
           onDeletePreference={(key, value) => void handleDeletePreference(key, value)}
           onEditPreference={(oldKey, oldValue, next) => void handleEditPreference(oldKey, oldValue, next)}
+          onExportBackup={handleExportMemoryBackup}
+          onImportBackup={handleImportMemoryBackup}
+          onCopyBackup={() => void handleCopyMemoryBackup()}
+          lastBackupDate={lastDailyBackupDate}
+        />
+
+        <input
+          ref={memoryBackupInputRef}
+          type="file"
+          accept="application/json"
+          className="hidden"
+          onChange={(event) => void handleMemoryBackupFileChange(event)}
         />
 
         {toast && (
