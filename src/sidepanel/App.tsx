@@ -31,7 +31,7 @@ import {
 import { buildJobExtractionPrompt, toJobDraft } from '../prompts/job-extractor';
 import type { JobData, SheetsConfig } from '../types/job';
 import { DEFAULT_SHEETS_CONFIG } from '../types/job';
-import { detectEmailDraft, saveGmailDraft, sendEmailViaGmail } from '../services/gmail-service';
+import { detectEmailDraft } from '../services/gmail-service';
 import type { EmailDraft } from '../types/email';
 import { buildConversationSummaryPrompt } from '../prompts/summarizer';
 import { buildPreferenceExtractionPrompt } from '../prompts/preference-extractor';
@@ -745,6 +745,17 @@ export default function App() {
     setIsEmailComposeOpen(true);
   };
 
+  const handleComposeEmailManually = () => {
+    // Open compose modal with empty draft for manual entry
+    const emptyDraft: EmailDraft = {
+      to: '',
+      subject: '',
+      body: '',
+    };
+    setEmailDraft(emptyDraft);
+    setIsEmailComposeOpen(true);
+  };
+
   const handleCopyEmailMessage = async (messageId: string) => {
     const message = messages.find((item) => item.id === messageId);
     if (!message) return;
@@ -776,23 +787,26 @@ export default function App() {
 
     setIsEmailBusy(true);
     try {
-      const sent = await sendEmailViaGmail({
-        clientId: googleSettings.clientId,
-        clientSecret: googleSettings.clientSecret,
-        draft: emailDraft,
-        relatedJobUrl: pageContext?.url,
-        relatedCompany: jobDraft?.company,
-      });
+      // Open Mail.app with pre-filled email
+      const subject = encodeURIComponent(emailDraft.subject || 'Job Application');
+      const body = encodeURIComponent(
+        `${emailDraft.body || ''}\n\n---\nSent from JobBuddy AI`
+      );
+      const recipient = encodeURIComponent(emailDraft.to || '');
+
+      const mailtoLink = `mailto:${recipient}?subject=${subject}&body=${body}`;
+      window.open(mailtoLink);
 
       setIsEmailComposeOpen(false);
       setToast({
         type: 'success',
-        message: `Email sent successfully (${sent.id.slice(0, 8)}).`,
+        message: 'Mail app opened. Add your resume, review, and send!',
       });
 
+      // Mark as emailed in sheet and update job tracking
       await maybeUpdateSheetAfterEmail();
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to send email via Gmail.';
+      const message = error instanceof Error ? error.message : 'Failed to open mail.';
       setToast({ type: 'error', message });
     } finally {
       setIsEmailBusy(false);
@@ -802,21 +816,9 @@ export default function App() {
   const handleSaveEmailDraft = async () => {
     if (!emailDraft) return;
 
-    setIsEmailBusy(true);
-    try {
-      await saveGmailDraft({
-        clientId: googleSettings.clientId,
-        clientSecret: googleSettings.clientSecret,
-        draft: emailDraft,
-      });
-      setIsEmailComposeOpen(false);
-      setToast({ type: 'success', message: 'Saved as Gmail draft.' });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to save Gmail draft.';
-      setToast({ type: 'error', message });
-    } finally {
-      setIsEmailBusy(false);
-    }
+    // Draft is already saved in local state; just close the modal
+    setIsEmailComposeOpen(false);
+    setToast({ type: 'success', message: 'Draft saved. You can edit it anytime.' });
   };
 
   const handleUpdateMemorySettings = async (nextSettings: MemorySettings) => {
@@ -1464,6 +1466,7 @@ export default function App() {
         onReadPage={handleReadPage}
         onAnalyzeJob={handleAnalyzeJob}
         onSaveToSheet={() => void handleExtractJobForSheet()}
+        onComposeEmail={handleComposeEmailManually}
         isLoading={isLoading}
         isReadingPage={isReadingPage}
         isExtractingJob={isExtractingJob}

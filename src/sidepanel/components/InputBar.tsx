@@ -7,6 +7,7 @@ interface InputBarProps {
   onReadPage: () => void;
   onAnalyzeJob: () => void;
   onSaveToSheet: () => void;
+  onComposeEmail: () => void;
   isLoading: boolean;
   isReadingPage: boolean;
   isExtractingJob: boolean;
@@ -21,6 +22,7 @@ export default function InputBar({
   onReadPage,
   onAnalyzeJob,
   onSaveToSheet,
+  onComposeEmail,
   isLoading,
   isReadingPage,
   isExtractingJob,
@@ -112,77 +114,90 @@ export default function InputBar({
         </div>
 
         {/* Quick actions */}
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-3 justify-center">
+          {/* Read Page Button */}
           <button
             onClick={onReadPage}
             disabled={isReadingPage}
-            className={`self-start flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border transition-all ${
+            className={`relative group flex items-center justify-center w-12 h-12 rounded-full transition-all duration-300 ${
               isReadingPage
-                ? 'border-blue-200 text-blue-400 bg-blue-50 cursor-not-allowed'
-                : 'border-gray-200 text-gray-600 hover:border-blue-300 hover:text-blue-600 hover:bg-blue-50 bg-white'
+                ? 'bg-gradient-to-br from-blue-400 to-cyan-400 text-white shadow-md cursor-not-allowed'
+                : 'bg-gradient-to-br from-blue-500 to-cyan-500 text-white hover:shadow-lg hover:scale-110 active:scale-95 shadow-md'
             }`}
+            title="Read Page"
           >
             {isReadingPage ? (
-              <>
-                <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4l3-3-3-3v4a8 8 0 00-8 8h4z" />
-                </svg>
-                Reading...
-              </>
+              <svg className="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4l3-3-3-3v4a8 8 0 00-8 8h4z" />
+              </svg>
             ) : (
-              <>
-                <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
-                </svg>
-                Read Page
-              </>
+              <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z" />
+              </svg>
             )}
+            <span className="absolute bottom-full mb-2 px-2 py-1 bg-gray-900 text-white text-xs rounded whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
+              Read Page
+            </span>
           </button>
 
+          {/* Analyze Job Button */}
           <button
             onClick={onAnalyzeJob}
             disabled={!canAnalyzeJob}
-            className={`self-start flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border transition-all ${
+            className={`relative group flex items-center justify-center w-12 h-12 rounded-full transition-all duration-300 ${
               canAnalyzeJob
-                ? 'border-blue-200 text-blue-700 bg-blue-50 hover:bg-blue-100 hover:border-blue-300'
-                : 'border-gray-200 text-gray-400 bg-gray-50 cursor-not-allowed'
+                ? 'bg-gradient-to-br from-purple-500 to-indigo-500 text-white hover:shadow-lg hover:scale-110 active:scale-95 shadow-md'
+                : 'bg-gray-300 text-gray-500 cursor-not-allowed'
             }`}
-            title={hasPageContext ? 'Analyze current job page' : 'Read page first to analyze'}
+            title="Analyze Job"
           >
-            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17v-6m3 6V7m3 10v-3m2 5H7a2 2 0 01-2-2V7a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V17a2 2 0 01-2 2z" />
+            <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 24 24">
+              <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z" />
             </svg>
-            Analyze Job
+            <span className="absolute bottom-full mb-2 px-2 py-1 bg-gray-900 text-white text-xs rounded whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
+              Analyze Job
+            </span>
           </button>
 
+          {/* Save to Sheet Button */}
           <button
             onClick={onSaveToSheet}
             disabled={!canSaveToSheet || isExtractingJob}
-            className={`self-start flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border transition-all ${
+            className={`relative group flex items-center justify-center w-12 h-12 rounded-full transition-all duration-300 ${
               canSaveToSheet && !isExtractingJob
-                ? 'border-emerald-200 text-emerald-700 bg-emerald-50 hover:bg-emerald-100 hover:border-emerald-300'
-                : 'border-gray-200 text-gray-400 bg-gray-50 cursor-not-allowed'
+                ? 'bg-gradient-to-br from-emerald-500 to-teal-500 text-white hover:shadow-lg hover:scale-110 active:scale-95 shadow-md'
+                : 'bg-gray-300 text-gray-500 cursor-not-allowed'
             }`}
-            title="Extract fields and save this job to your Google Sheet"
+            title="Save to Sheet"
           >
             {isExtractingJob ? (
-              <>
-                <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4l3-3-3-3v4a8 8 0 00-8 8h4z" />
-                </svg>
-                Extracting...
-              </>
+              <svg className="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4l3-3-3-3v4a8 8 0 00-8 8h4z" />
+              </svg>
             ) : (
-              <>
-                <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17v-6m3 6V7m3 10v-3m2 5H7a2 2 0 01-2-2V7a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V17a2 2 0 01-2 2z" />
-                </svg>
-                Save to Sheet
-              </>
+              <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zM9 17H7v-7h2V17zm4 0h-2V7h2V17zm4 0h-2v-4h2V17z" />
+              </svg>
             )}
+            <span className="absolute bottom-full mb-2 px-2 py-1 bg-gray-900 text-white text-xs rounded whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
+              Save to Sheet
+            </span>
+          </button>
+
+          {/* Compose Email Button */}
+          <button
+            onClick={onComposeEmail}
+            className="relative group flex items-center justify-center w-12 h-12 rounded-full transition-all duration-300 bg-gradient-to-br from-red-500 to-pink-500 text-white hover:shadow-lg hover:scale-110 active:scale-95 shadow-md"
+            title="Compose Email"
+          >
+            <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 24 24">
+              <path d="M20 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z" />
+            </svg>
+            <span className="absolute bottom-full mb-2 px-2 py-1 bg-gray-900 text-white text-xs rounded whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
+              Compose Email
+            </span>
           </button>
         </div>
       </div>
