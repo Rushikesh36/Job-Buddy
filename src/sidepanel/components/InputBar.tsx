@@ -5,8 +5,13 @@ interface InputBarProps {
   onChange: (val: string) => void;
   onSend: () => void;
   onReadPage: () => void;
+  onAnalyzeJob: () => void;
+  onSaveToSheet: () => void;
   isLoading: boolean;
   isReadingPage: boolean;
+  isExtractingJob: boolean;
+  hasPageContext: boolean;
+  canSaveToSheet: boolean;
 }
 
 export default function InputBar({
@@ -14,8 +19,13 @@ export default function InputBar({
   onChange,
   onSend,
   onReadPage,
+  onAnalyzeJob,
+  onSaveToSheet,
   isLoading,
   isReadingPage,
+  isExtractingJob,
+  hasPageContext,
+  canSaveToSheet,
 }: InputBarProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -40,6 +50,7 @@ export default function InputBar({
   };
 
   const canSend = !isLoading && value.trim().length > 0;
+  const canAnalyzeJob = !isLoading && !isReadingPage && hasPageContext;
 
   return (
     <div className="border-t border-gray-200 bg-white px-3 pt-2 pb-3">
@@ -100,34 +111,80 @@ export default function InputBar({
           </button>
         </div>
 
-        {/* Read Page button */}
-        <button
-          onClick={onReadPage}
-          disabled={isReadingPage}
-          className={`self-start flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border transition-all ${
-            isReadingPage
-              ? 'border-blue-200 text-blue-400 bg-blue-50 cursor-not-allowed'
-              : 'border-gray-200 text-gray-600 hover:border-blue-300 hover:text-blue-600 hover:bg-blue-50 bg-white'
-          }`}
-        >
-          {isReadingPage ? (
-            <>
-              <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4l3-3-3-3v4a8 8 0 00-8 8h4z" />
-              </svg>
-              Reading...
-            </>
-          ) : (
-            <>
-              <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
-              </svg>
-              Read Page
-            </>
-          )}
-        </button>
+        {/* Quick actions */}
+        <div className="flex items-center gap-2">
+          <button
+            onClick={onReadPage}
+            disabled={isReadingPage}
+            className={`self-start flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border transition-all ${
+              isReadingPage
+                ? 'border-blue-200 text-blue-400 bg-blue-50 cursor-not-allowed'
+                : 'border-gray-200 text-gray-600 hover:border-blue-300 hover:text-blue-600 hover:bg-blue-50 bg-white'
+            }`}
+          >
+            {isReadingPage ? (
+              <>
+                <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4l3-3-3-3v4a8 8 0 00-8 8h4z" />
+                </svg>
+                Reading...
+              </>
+            ) : (
+              <>
+                <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                </svg>
+                Read Page
+              </>
+            )}
+          </button>
+
+          <button
+            onClick={onAnalyzeJob}
+            disabled={!canAnalyzeJob}
+            className={`self-start flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border transition-all ${
+              canAnalyzeJob
+                ? 'border-blue-200 text-blue-700 bg-blue-50 hover:bg-blue-100 hover:border-blue-300'
+                : 'border-gray-200 text-gray-400 bg-gray-50 cursor-not-allowed'
+            }`}
+            title={hasPageContext ? 'Analyze current job page' : 'Read page first to analyze'}
+          >
+            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17v-6m3 6V7m3 10v-3m2 5H7a2 2 0 01-2-2V7a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V17a2 2 0 01-2 2z" />
+            </svg>
+            Analyze Job
+          </button>
+
+          <button
+            onClick={onSaveToSheet}
+            disabled={!canSaveToSheet || isExtractingJob}
+            className={`self-start flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border transition-all ${
+              canSaveToSheet && !isExtractingJob
+                ? 'border-emerald-200 text-emerald-700 bg-emerald-50 hover:bg-emerald-100 hover:border-emerald-300'
+                : 'border-gray-200 text-gray-400 bg-gray-50 cursor-not-allowed'
+            }`}
+            title="Extract fields and save this job to your Google Sheet"
+          >
+            {isExtractingJob ? (
+              <>
+                <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4l3-3-3-3v4a8 8 0 00-8 8h4z" />
+                </svg>
+                Extracting...
+              </>
+            ) : (
+              <>
+                <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17v-6m3 6V7m3 10v-3m2 5H7a2 2 0 01-2-2V7a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V17a2 2 0 01-2 2z" />
+                </svg>
+                Save to Sheet
+              </>
+            )}
+          </button>
+        </div>
       </div>
     </div>
   );

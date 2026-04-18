@@ -20,9 +20,17 @@ interface JobAnalysis {
   skills: Skill[];
   atsScore: number | null;
   atsNote: string;
+  profileMatchQuality: string;
+  profileMatchNote: string;
   applyDecision: string;
   applyNote: string;
+  recruiterReachoutDecision: string;
+  recruiterReachoutNote: string;
+  tailorResumeDecision: string;
+  tailorResumeNote: string;
   salary: string;
+  unpaidCheck: string;
+  unpaidNote: string;
 }
 
 function isJobAnalysis(content: string): boolean {
@@ -52,16 +60,69 @@ function parseJobAnalysis(content: string): JobAnalysis {
   const atsScore = atsScoreMatch ? parseInt(atsScoreMatch[1], 10) : null;
   const atsNote = content.match(/\*\*ATS Match Score:.*?\*\*\n(.+)/)?.[1]?.trim() ?? '';
 
+  // Profile match quality
+  const profileMatchQuality =
+    content.match(/\*\*Profile Match Quality:\*\*\s*(.+)/)?.[1]?.trim() ?? '';
+  const profileMatchNote =
+    content.match(/\*\*Profile Match Quality:\*\*.*\n(.+)/)?.[1]?.trim() ?? '';
+
   // Apply decision and optional note
-  const applyBlock = content.match(/\*\*Should You Apply\?\*\*\n([\s\S]*?)(?=\n\*\*Salary|\n\n\*\*|$)/)?.[1]?.trim() ?? '';
+  const applyBlock =
+    content.match(/\*\*Should You Apply\?\*\*\n([\s\S]*?)(?=\n\*\*|$)/)?.[1]?.trim() ?? '';
   const applyLines = applyBlock.split('\n').map((l) => l.trim()).filter(Boolean);
   const applyDecision = applyLines[0] ?? '';
   const applyNote = applyLines.slice(1).join(' ').trim();
 
+  // Recruiter outreach recommendation
+  const recruiterBlock =
+    content
+      .match(
+        /\*\*Should You Find Recruiter Email and Reach Out\?\*\*\n([\s\S]*?)(?=\n\*\*Should You Tailor Resume|\n\n\*\*|$)/
+      )?.[1]
+      ?.trim() ?? '';
+  const recruiterLines = recruiterBlock.split('\n').map((l) => l.trim()).filter(Boolean);
+  const recruiterReachoutDecision = recruiterLines[0] ?? '';
+  const recruiterReachoutNote = recruiterLines.slice(1).join(' ').trim();
+
+  // Resume tailoring recommendation
+  const tailorBlock =
+    content
+      .match(
+        /\*\*Should You Tailor Resume Before Applying\?\*\*\n([\s\S]*?)(?=\n\*\*Salary|\n\n\*\*|$)/
+      )?.[1]
+      ?.trim() ?? '';
+  const tailorLines = tailorBlock.split('\n').map((l) => l.trim()).filter(Boolean);
+  const tailorResumeDecision = tailorLines[0] ?? '';
+  const tailorResumeNote = tailorLines.slice(1).join(' ').trim();
+
   // Salary block
   const salary = content.match(/\*\*Salary Range[^*]*\*\*\n([\s\S]*?)(?:\n\n|$)/)?.[1]?.trim() ?? '';
 
-  return { company, role, skills, atsScore, atsNote, applyDecision, applyNote, salary };
+  // Unpaid check
+  const unpaidBlock =
+    content.match(/\*\*Unpaid Check:\*\*\n([\s\S]*?)(?:\n\n|$)/)?.[1]?.trim() ?? '';
+  const unpaidLines = unpaidBlock.split('\n').map((l) => l.trim()).filter(Boolean);
+  const unpaidCheck = unpaidLines[0] ?? '';
+  const unpaidNote = unpaidLines.slice(1).join(' ').trim();
+
+  return {
+    company,
+    role,
+    skills,
+    atsScore,
+    atsNote,
+    profileMatchQuality,
+    profileMatchNote,
+    applyDecision,
+    applyNote,
+    recruiterReachoutDecision,
+    recruiterReachoutNote,
+    tailorResumeDecision,
+    tailorResumeNote,
+    salary,
+    unpaidCheck,
+    unpaidNote,
+  };
 }
 
 // ── Job Analysis Card ──────────────────────────────────────────────────────────
@@ -70,6 +131,9 @@ function JobAnalysisCard({ content }: { content: string }) {
   const d = parseJobAnalysis(content);
   const isYes = /^yes/i.test(d.applyDecision);
   const isNo = /^no/i.test(d.applyDecision);
+  const shouldReachOut = /^yes/i.test(d.recruiterReachoutDecision);
+  const shouldTailor = /^yes/i.test(d.tailorResumeDecision);
+  const isUnpaid = /^unpaid/i.test(d.unpaidCheck);
 
   const atsColor =
     d.atsScore === null ? 'bg-gray-400'
@@ -134,6 +198,52 @@ function JobAnalysisCard({ content }: { content: string }) {
         </div>
       )}
 
+      {/* Profile match quality */}
+      {d.profileMatchQuality && (
+        <div className="bg-blue-50 border border-blue-200 rounded-lg px-3 py-2">
+          <p className="text-[10px] font-semibold text-blue-500 uppercase tracking-wide mb-0.5">
+            Profile Match Quality
+          </p>
+          <p className="text-xs font-semibold text-blue-800 leading-snug">{d.profileMatchQuality}</p>
+          {d.profileMatchNote && (
+            <p className="text-[11px] text-blue-700 mt-0.5 leading-snug">{d.profileMatchNote}</p>
+          )}
+        </div>
+      )}
+
+      {/* Recruiter outreach + tailoring recommendations */}
+      {(d.recruiterReachoutDecision || d.tailorResumeDecision) && (
+        <div className="grid grid-cols-1 gap-2">
+          {d.recruiterReachoutDecision && (
+            <div className="bg-gray-50 border border-gray-200 rounded-lg px-3 py-2">
+              <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide mb-0.5">
+                Reach Out To Recruiter?
+              </p>
+              <p className={`text-xs font-semibold ${shouldReachOut ? 'text-emerald-700' : 'text-red-700'}`}>
+                {d.recruiterReachoutDecision}
+              </p>
+              {d.recruiterReachoutNote && (
+                <p className="text-[11px] text-gray-600 mt-0.5 leading-snug">{d.recruiterReachoutNote}</p>
+              )}
+            </div>
+          )}
+
+          {d.tailorResumeDecision && (
+            <div className="bg-gray-50 border border-gray-200 rounded-lg px-3 py-2">
+              <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide mb-0.5">
+                Tailor Resume Before Applying?
+              </p>
+              <p className={`text-xs font-semibold ${shouldTailor ? 'text-amber-700' : 'text-emerald-700'}`}>
+                {d.tailorResumeDecision}
+              </p>
+              {d.tailorResumeNote && (
+                <p className="text-[11px] text-gray-600 mt-0.5 leading-snug">{d.tailorResumeNote}</p>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Skills */}
       {d.skills.length > 0 && (
         <div>
@@ -162,6 +272,33 @@ function JobAnalysisCard({ content }: { content: string }) {
             Salary (OPT / CPT / H-1B)
           </p>
           <p className="text-xs text-gray-700 leading-snug">{d.salary}</p>
+        </div>
+      )}
+
+      {/* Unpaid check (always at bottom when present) */}
+      {d.unpaidCheck && (
+        <div
+          className={`rounded-lg px-3 py-2 border ${
+            isUnpaid
+              ? 'bg-red-50 border-red-200'
+              : 'bg-emerald-50 border-emerald-200'
+          }`}
+        >
+          <p
+            className={`text-[10px] font-semibold uppercase tracking-wide mb-0.5 ${
+              isUnpaid ? 'text-red-500' : 'text-emerald-600'
+            }`}
+          >
+            Compensation Status
+          </p>
+          <p className={`text-xs font-bold ${isUnpaid ? 'text-red-700' : 'text-emerald-700'}`}>
+            {d.unpaidCheck}
+          </p>
+          {d.unpaidNote && (
+            <p className={`text-[11px] mt-0.5 leading-snug ${isUnpaid ? 'text-red-700' : 'text-emerald-700'}`}>
+              {d.unpaidNote}
+            </p>
+          )}
         </div>
       )}
     </div>

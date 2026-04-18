@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import type { ChatMessage } from '../../lib/types';
 import MessageBubble from './MessageBubble';
+import EmailActionsBar from './EmailActionsBar';
 
 const SUGGESTED_PROMPTS = [
   'Analyze this job description and match it to my profile',
@@ -13,12 +14,20 @@ interface ChatWindowProps {
   messages: ChatMessage[];
   isLoading: boolean;
   onSuggestedPrompt: (prompt: string) => void;
+  onSendViaGmail: (messageId: string) => void;
+  onEditAndSend: (messageId: string) => void;
+  onCopyEmail: (messageId: string) => void;
+  isEmailMessage: (messageId: string) => boolean;
 }
 
 export default function ChatWindow({
   messages,
   isLoading,
   onSuggestedPrompt,
+  onSendViaGmail,
+  onEditAndSend,
+  onCopyEmail,
+  isEmailMessage,
 }: ChatWindowProps) {
   const bottomRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -64,7 +73,16 @@ export default function ChatWindow({
       ) : (
         <>
           {messages.map((msg) => (
-            <MessageBubble key={msg.id} message={msg} />
+            <div key={msg.id}>
+              <MessageBubble message={msg} />
+              {msg.role === 'assistant' && isEmailMessage(msg.id) && (
+                <EmailActionsBar
+                  onSendViaGmail={() => onSendViaGmail(msg.id)}
+                  onEditAndSend={() => onEditAndSend(msg.id)}
+                  onCopy={() => onCopyEmail(msg.id)}
+                />
+              )}
+            </div>
           ))}
           {/* Loading indicator: three dots */}
           {isLoading && messages[messages.length - 1]?.role === 'user' && (

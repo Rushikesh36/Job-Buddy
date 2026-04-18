@@ -41,6 +41,49 @@ export interface ProviderSettings {
   selectedModels: Record<LLMProvider, string>;
 }
 
+export interface GoogleAuthState {
+  isConnected: boolean;
+  accessToken: string | null;
+  refreshToken: string | null;
+  email: string | null;
+  expiresAt: number | null;
+}
+
+export interface GoogleSettings {
+  clientId: string;
+  clientSecret: string;
+}
+
+export interface GoogleSettingsStorage {
+  googleAuthState: GoogleAuthState;
+  googleSettings: GoogleSettings;
+}
+
+export interface GoogleTokens {
+  accessToken: string;
+  refreshToken: string | null;
+  expiresAt: number;
+}
+
+export const GOOGLE_SCOPES = [
+  'https://www.googleapis.com/auth/spreadsheets',
+  'https://www.googleapis.com/auth/gmail.send',
+  'https://www.googleapis.com/auth/userinfo.email',
+] as const;
+
+export const DEFAULT_GOOGLE_AUTH_STATE: GoogleAuthState = {
+  isConnected: false,
+  accessToken: null,
+  refreshToken: null,
+  email: null,
+  expiresAt: null,
+};
+
+export const DEFAULT_GOOGLE_SETTINGS: GoogleSettings = {
+  clientId: '',
+  clientSecret: '',
+};
+
 export const DEFAULT_MODELS: Record<LLMProvider, string> = {
   claude: 'claude-sonnet-4-20250514',
   gemini: 'gemini-2.5-flash',
@@ -60,6 +103,8 @@ export type MessageType =
   | 'PAGE_CONTENT_RESULT'
   | 'PAGE_CONTENT_ERROR'
   | 'SEND_TO_LLM'
+  | 'EXTRACT_JOB_DATA'
+  | 'RUN_LLM_UTILITY'
   // keep backward-compat alias
   | 'SEND_TO_CLAUDE'
   | 'CLAUDE_STREAM_CHUNK'
@@ -77,6 +122,28 @@ export interface SendToLLMPayload {
   pageContext: PageContext | null;
   llmConfig: LLMConfig;
   messageId: string;
+  memoryContext?: {
+    relevantMemories: string[];
+    learnedPreferences: string[];
+  };
+}
+
+export interface ExtractJobDataPayload {
+  prompt: string;
+  llmConfig: LLMConfig;
+}
+
+export interface ExtractJobDataResult {
+  content: string;
+}
+
+export interface RunLLMUtilityPayload {
+  prompt: string;
+  llmConfig: LLMConfig;
+}
+
+export interface RunLLMUtilityResult {
+  content: string;
 }
 
 // backward compat alias

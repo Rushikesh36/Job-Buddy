@@ -1,4 +1,13 @@
-import type { SendToLLMPayload, StreamChunkPayload, StreamDonePayload, StreamErrorPayload } from '../lib/types';
+import type {
+  SendToLLMPayload,
+  StreamChunkPayload,
+  StreamDonePayload,
+  StreamErrorPayload,
+  ExtractJobDataPayload,
+  ExtractJobDataResult,
+  RunLLMUtilityPayload,
+  RunLLMUtilityResult,
+} from '../lib/types';
 import { streamLLMResponse } from '../lib/llm-api';
 import { buildSystemPrompt } from '../config/system-prompt';
 import { MY_PROFILE } from '../lib/profile';
@@ -83,9 +92,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // ---- SEND_TO_LLM (also accepts legacy SEND_TO_CLAUDE) ----
   if (message?.type === 'SEND_TO_LLM' || message?.type === 'SEND_TO_CLAUDE') {
     const payload = message.payload as SendToLLMPayload;
-    const { messages, pageContext, llmConfig, messageId } = payload;
+    const { messages, pageContext, llmConfig, messageId, memoryContext } = payload;
 
-    const systemPrompt = buildSystemPrompt(MY_PROFILE, pageContext);
+    const systemPrompt = buildSystemPrompt(MY_PROFILE, pageContext, memoryContext ?? null);
 
     sendResponse({ messageId });
 
@@ -101,6 +110,60 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       onError: (error) => {
         const errPayload: StreamErrorPayload = { error, messageId };
         chrome.runtime.sendMessage({ type: 'CLAUDE_STREAM_ERROR', payload: errPayload }).catch(() => {});
+      },
+    });
+
+    return true;
+  }
+
+  // ---- EXTRACT_JOB_DATA: one-shot structured extraction using active provider ----
+  if (message?.type === 'EXTRACT_JOB_DATA') {
+    const payload = message.payload as ExtractJobDataPayload;
+
+    const messages = [{ role: 'user' as const, content: payload.prompt }];
+    let collected = '';
+    let hasResponded = false;
+
+    streamLLMResponse(messages, 'Return only valid JSON. No markdown or explanations.', payload.llmConfig, {
+      onChunk: (text) => {
+        collected += text;
+      },
+      onDone: () => {
+        if (hasResponded) return;
+        hasResponded = true;
+        const result: ExtractJobDataResult = { content: collected };
+        sendResponse({ success: true, data: result });
+      },
+      onError: (error) => {
+        if (hasResponded) return;
+        hasResponded = true;
+        sendResponse({ success: false, error });
+      },
+    });
+
+    return true;
+  }
+
+  if (message?.type === 'RUN_LLM_UTILITY') {
+    const payload = message.payload as RunLLMUtilityPayload;
+    const messages = [{ role: 'user' as const, content: payload.prompt }];
+    let collected = '';
+    let hasResponded = false;
+
+    streamLLMResponse(messages, 'Return the best direct answer to the user request.', payload.llmConfig, {
+      onChunk: (text) => {
+        collected += text;
+      },
+      onDone: () => {
+        if (hasResponded) return;
+        hasResponded = true;
+        const result: RunLLMUtilityResult = { content: collected };
+        sendResponse({ success: true, data: result });
+      },
+      onError: (error) => {
+        if (hasResponded) return;
+        hasResponded = true;
+        sendResponse({ success: false, error });
       },
     });
 
