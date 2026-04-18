@@ -1,4 +1,5 @@
 import type { Memory, UserPreference } from '../../types/memory';
+import type { JobHuntSummary } from '../../services/activity-service';
 import MemoryItem from './MemoryItem';
 import PreferencesPanel from './PreferencesPanel';
 
@@ -15,6 +16,16 @@ interface MemoryPanelProps {
   onImportBackup: () => void;
   onCopyBackup: () => void;
   lastBackupDate: string | null;
+  jobHuntSummary: JobHuntSummary;
+}
+
+function MetricRow({ label, value }: { label: string; value: number }) {
+  return (
+    <div className="rounded-lg bg-white/70 px-2 py-1.5 text-center ring-1 ring-black/5">
+      <p className="text-[10px] uppercase tracking-wide text-gray-500">{label}</p>
+      <p className="text-sm font-semibold text-gray-900">{value}</p>
+    </div>
+  );
 }
 
 function formatBytes(bytes: number): string {
@@ -36,6 +47,7 @@ export default function MemoryPanel({
   onImportBackup,
   onCopyBackup,
   lastBackupDate,
+  jobHuntSummary,
 }: MemoryPanelProps) {
   const usagePercent = Math.min(100, Math.round((memories.length / Math.max(1, maxMemories)) * 100));
   const lastBackupLabel = lastBackupDate === new Date().toISOString().slice(0, 10)
@@ -46,6 +58,44 @@ export default function MemoryPanel({
 
   return (
     <div className="flex-1 overflow-y-auto px-3 py-3 space-y-4">
+      <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <p className="text-xs font-semibold text-gray-900">Job Hunt Summary</p>
+            <p className="text-[11px] leading-4 text-gray-500">Track applications and outreach automatically.</p>
+          </div>
+          <span className="rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-medium text-blue-700">live</span>
+        </div>
+
+        <div className="mt-3 space-y-3">
+          <div className="rounded-xl border border-blue-100 bg-blue-50/70 p-3">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-xs font-semibold text-blue-900">Applications</p>
+              <span className="text-[11px] text-blue-700">saved to sheet</span>
+            </div>
+            <div className="mt-2 grid grid-cols-4 gap-2">
+              <MetricRow label="Today" value={jobHuntSummary.applications.today} />
+              <MetricRow label="Week" value={jobHuntSummary.applications.week} />
+              <MetricRow label="Month" value={jobHuntSummary.applications.month} />
+              <MetricRow label="Total" value={jobHuntSummary.applications.total} />
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-violet-100 bg-violet-50/70 p-3">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-xs font-semibold text-violet-900">Networking Outreach</p>
+              <span className="text-[11px] text-violet-700">email opens</span>
+            </div>
+            <div className="mt-2 grid grid-cols-4 gap-2">
+              <MetricRow label="Today" value={jobHuntSummary.outreach.today} />
+              <MetricRow label="Week" value={jobHuntSummary.outreach.week} />
+              <MetricRow label="Month" value={jobHuntSummary.outreach.month} />
+              <MetricRow label="Total" value={jobHuntSummary.outreach.total} />
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
         <div className="space-y-3">
           <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">

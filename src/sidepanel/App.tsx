@@ -29,6 +29,7 @@ import {
   normalizeSpreadsheetId,
   saveSheetsConfig,
 } from '../services/sheets-service';
+import { buildJobHuntSummary, loadActivityStore, recordApplication, recordOutreach, saveActivityStore, type ActivityStore } from '../services/activity-service';
 import { buildJobExtractionPrompt, toJobDraft } from '../prompts/job-extractor';
 import type { JobData, SheetsConfig } from '../types/job';
 import { DEFAULT_SHEETS_CONFIG } from '../types/job';
@@ -140,6 +141,7 @@ export default function App() {
   const [lastPromptMemoryContext, setLastPromptMemoryContext] = useState<PromptMemoryContext | null>(null);
   const [isMemoryBusy, setIsMemoryBusy] = useState(false);
   const [lastDailyBackupDate, setLastDailyBackupDate] = useState<string | null>(null);
+  const [activityStore, setActivityStore] = useState<ActivityStore>({ days: [] });
   const memoryBackupInputRef = useRef<HTMLInputElement>(null);
   const hasHydratedMemoryRef = useRef(false);
   const dailyBackupInFlightRef = useRef(false);
@@ -159,6 +161,7 @@ export default function App() {
       loadMemoryStore(),
       loadMemorySettings(),
       getLastDailyMemoryBackupDate(),
+      loadActivityStore(),
     ]).then(
       ([
         settings,
@@ -168,6 +171,7 @@ export default function App() {
         storedMemoryStore,
         storedMemorySettings,
         storedLastDailyBackupDate,
+        storedActivityStore,
       ]) => {
         setProviderSettings(settings);
         setSettingsTab(settings.selectedProvider);
@@ -180,6 +184,7 @@ export default function App() {
         setMemoryStore(storedMemoryStore);
         setMemorySettingsState(storedMemorySettings);
         setLastDailyBackupDate(storedLastDailyBackupDate);
+        setActivityStore(storedActivityStore);
         hasHydratedMemoryRef.current = true;
         const activeKey = settings.apiKeys[settings.selectedProvider];
         if (!activeKey) setView('settings');
@@ -221,29 +226,6 @@ export default function App() {
     const timeoutId = window.setTimeout(() => setToast(null), 3200);
     return () => window.clearTimeout(timeoutId);
   }, [toast]);
-
-  useEffect(() => {
-    if (!memorySettings.autoSummarize || isLoading || isMemoryBusy || messages.length < 2) return;
-
-    const lastAssistant = [...messages].reverse().find((message) => message.role === 'assistant');
-    if (!lastAssistant || !lastAssistant.content.trim()) return;
-    if (lastAutoSavedAssistantIdRef.current === lastAssistant.id) return;
-
-    let cancelled = false;
-
-    const saveCurrentChat = async () => {
-      await summarizeCurrentConversationToMemory();
-      if (!cancelled) {
-        lastAutoSavedAssistantIdRef.current = lastAssistant.id;
-      }
-    };
-
-    void saveCurrentChat();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [isLoading, isMemoryBusy, messages, memorySettings.autoSummarize, summarizeCurrentConversationToMemory]);
 
   useEffect(() => {
     const flags: Record<string, boolean> = {};
@@ -413,6 +395,29 @@ export default function App() {
     setLastPromptMemoryContext(null);
     lastAutoSavedAssistantIdRef.current = null;
   }, [messages, memorySettings.autoSummarize, summarizeCurrentConversationToMemory]);
+
+  useEffect(() => {
+    if (!memorySettings.autoSummarize || isLoading || isMemoryBusy || messages.length < 2) return;
+
+    const lastAssistant = [...messages].reverse().find((message) => message.role === 'assistant');
+    if (!lastAssistant || !lastAssistant.content.trim()) return;
+    if (lastAutoSavedAssistantIdRef.current === lastAssistant.id) return;
+
+    let cancelled = false;
+
+    const saveCurrentChat = async () => {
+      await summarizeCurrentConversationToMemory();
+      if (!cancelled) {
+        lastAutoSavedAssistantIdRef.current = lastAssistant.id;
+      }
+    };
+
+    void saveCurrentChat();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isLoading, isMemoryBusy, messages, memorySettings.autoSummarize, summarizeCurrentConversationToMemory]);
 
   const handleSend = useCallback(
     (overrideText?: string) => {
@@ -761,6 +766,14 @@ export default function App() {
         jobData: jobDraft,
       });
 
+      try {
+        const nextActivityStore = recordApplication(activityStore);
+        await saveActivityStore(nextActivityStore);
+        setActivityStore(nextActivityStore);
+      } catch {
+        // Ignore tracking failures so the application save still succeeds.
+      }
+
       setIsJobSaveModalOpen(false);
       setToast({
         type: 'success',
@@ -822,6 +835,8 @@ export default function App() {
         to: '',
         subject: '',
         body: '',
+        attachResume: false,
+        isHtml: false,
       };
       setEmailDraft(emptyDraft);
       setIsEmailComposeOpen(true);
@@ -852,6 +867,7 @@ export default function App() {
           subject,
           body: emailBody,
           attachResume: true,
+          isHtml: false,
         };
 
         setEmailDraft(draft);
@@ -876,6 +892,8 @@ export default function App() {
           to: '',
           subject: '',
           body: '',
+          attachResume: false,
+          isHtml: false,
         };
         setEmailDraft(emptyDraft);
         setIsEmailComposeOpen(true);
@@ -923,6 +941,14 @@ export default function App() {
 
       const mailtoLink = `mailto:${recipient}?subject=${subject}&body=${body}`;
       window.open(mailtoLink);
+
+      try {
+        const nextActivityStore = recordOutreach(activityStore);
+        await saveActivityStore(nextActivityStore);
+        setActivityStore(nextActivityStore);
+      } catch {
+        // Ignore tracking failures so email composition still succeeds.
+      }
 
       setIsEmailComposeOpen(false);
       setToast({
@@ -1035,6 +1061,8 @@ export default function App() {
       setToast({ type: 'error', message: 'Could not copy the memory backup.' });
     }
   }, [memoryStore, memorySettings]);
+
+  const jobHuntSummary = buildJobHuntSummary(activityStore);
 
   const handleMemoryBackupFileChange = useCallback(
     async (event: ChangeEvent<HTMLInputElement>) => {
@@ -1532,6 +1560,7 @@ export default function App() {
           onImportBackup={handleImportMemoryBackup}
           onCopyBackup={() => void handleCopyMemoryBackup()}
           lastBackupDate={lastDailyBackupDate}
+          jobHuntSummary={jobHuntSummary}
         />
 
         <input
