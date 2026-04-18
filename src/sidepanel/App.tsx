@@ -35,6 +35,7 @@ import { detectEmailDraft } from '../services/gmail-service';
 import type { EmailDraft } from '../types/email';
 import { buildConversationSummaryPrompt } from '../prompts/summarizer';
 import { buildPreferenceExtractionPrompt } from '../prompts/preference-extractor';
+import { buildRecruiterExtractionPrompt, parseRecruiterInfo, buildColdEmailBody } from '../prompts/recruiter-extractor';
 import {
   applyMemoryLimits,
   buildPromptMemoryContext,
@@ -746,14 +747,74 @@ export default function App() {
   };
 
   const handleComposeEmailManually = () => {
-    // Open compose modal with empty draft for manual entry
-    const emptyDraft: EmailDraft = {
-      to: '',
-      subject: '',
-      body: '',
-    };
-    setEmailDraft(emptyDraft);
-    setIsEmailComposeOpen(true);
+    // Extract recruiter info from page and auto-fill email
+    if (!pageContext?.textContent) {
+      // No page context, open with empty draft
+      const emptyDraft: EmailDraft = {
+        to: '',
+        subject: '',
+        body: '',
+      };
+      setEmailDraft(emptyDraft);
+      setIsEmailComposeOpen(true);
+      return;
+    }
+
+    setIsEmailBusy(true);
+    setErrorBanner(null);
+
+    (async () => {
+      try {
+        // Use LLM to extract recruiter info
+        const recruiterPrompt = buildRecruiterExtractionPrompt(pageContext.textContent);
+        const recruiterResponse = await runUtilityPrompt(recruiterPrompt);
+        const recruiterInfo = parseRecruiterInfo(recruiterResponse);
+
+        // Build email with recruiter details
+        const emailBody = buildColdEmailBody({
+          recruiterName: recruiterInfo.recruiterName,
+          companyName: recruiterInfo.companyName,
+          jobTitle: recruiterInfo.jobTitle,
+        });
+
+        const subject = `Application for ${recruiterInfo.jobTitle} at ${recruiterInfo.companyName}`;
+
+        const draft: EmailDraft = {
+          to: recruiterInfo.recruiterEmail || '',
+          subject,
+          body: emailBody,
+          attachResume: true,
+        };
+
+        setEmailDraft(draft);
+        setIsEmailComposeOpen(true);
+
+        if (recruiterInfo.recruiterEmail) {
+          setToast({
+            type: 'success',
+            message: `Found recruiter: ${recruiterInfo.recruiterName}. Review and send!`,
+          });
+        } else {
+          setToast({
+            type: 'error',
+            message: 'Could not find recruiter email on this page. Please enter it manually.',
+          });
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to extract recruiter info.';
+        setErrorBanner(message);
+        // Still open with empty draft as fallback
+        const emptyDraft: EmailDraft = {
+          to: '',
+          subject: '',
+          body: '',
+        };
+        setEmailDraft(emptyDraft);
+        setIsEmailComposeOpen(true);
+      } finally {
+        setIsEmailBusy(false);
+      }
+    })();
   };
 
   const handleCopyEmailMessage = async (messageId: string) => {
@@ -789,9 +850,7 @@ export default function App() {
     try {
       // Open Mail.app with pre-filled email
       const subject = encodeURIComponent(emailDraft.subject || 'Job Application');
-      const body = encodeURIComponent(
-        `${emailDraft.body || ''}\n\n---\nSent from JobBuddy AI`
-      );
+      const body = encodeURIComponent(emailDraft.body || '');
       const recipient = encodeURIComponent(emailDraft.to || '');
 
       const mailtoLink = `mailto:${recipient}?subject=${subject}&body=${body}`;
