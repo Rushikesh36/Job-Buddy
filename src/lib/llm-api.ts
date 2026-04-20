@@ -5,7 +5,7 @@
  * `streamLLMResponse` dispatches to the right one based on LLMConfig.provider.
  */
 
-import type { LLMMessage, LLMConfig } from './types';
+import type { LLMMessage, LLMConfig, LLMProvider } from './types';
 
 // ---------------------------------------------------------------------------
 // Provider catalog — consumed by the settings UI
@@ -26,7 +26,7 @@ export interface ProviderMeta {
   hintUrl: string;
 }
 
-export const PROVIDER_META: Record<string, ProviderMeta> = {
+export const PROVIDER_META: Record<LLMProvider, ProviderMeta> = {
   claude: {
     label: 'Claude',
     color: '#D97757',
@@ -68,6 +68,25 @@ export const PROVIDER_META: Record<string, ProviderMeta> = {
     keyPlaceholder: 'sk-proj-…',
     keyGuide: 'platform.openai.com/api-keys',
     hintUrl: 'https://platform.openai.com/api-keys',
+  },
+  openrouter: {
+    label: 'OpenRouter',
+    color: '#6C47FF',
+    models: [
+      { id: 'meta-llama/llama-3.1-8b-instruct:free', name: 'Llama 3.1 8B Instruct (Free)' },
+      { id: 'google/gemma-2-9b-it:free', name: 'Gemma 2 9B Instruct (Free)' },
+      { id: 'qwen/qwen-2.5-7b-instruct:free', name: 'Qwen 2.5 7B Instruct (Free)' },
+      { id: 'mistralai/mistral-7b-instruct:free', name: 'Mistral 7B Instruct (Free)' },
+      { id: 'openrouter/auto', name: 'OpenRouter Auto (May Require Credits)' },
+      { id: 'deepseek/deepseek-chat-v3-0324', name: 'DeepSeek Chat v3 (May Require Credits)' },
+      { id: 'google/gemini-2.5-flash', name: 'Gemini 2.5 Flash via OpenRouter (May Require Credits)' },
+      { id: 'openai/gpt-4o-mini', name: 'GPT-4o mini via OpenRouter (May Require Credits)' },
+      { id: 'anthropic/claude-3.5-haiku', name: 'Claude 3.5 Haiku via OpenRouter (May Require Credits)' },
+    ],
+    defaultModel: 'meta-llama/llama-3.1-8b-instruct:free',
+    keyPlaceholder: 'sk-or-v1-…',
+    keyGuide: 'openrouter.ai/keys',
+    hintUrl: 'https://openrouter.ai/keys',
   },
 };
 
@@ -132,6 +151,15 @@ function handleHttpError(status: number, body: unknown, providerName: string): s
     return `Rate limit reached (${providerName}). Wait a moment, or switch to a model with higher free-tier limits in Settings (e.g. Gemini 2.0 Flash-Lite).`;
   if (status === 503 || status === 529)
     return `${providerName} API is temporarily overloaded. Please try again.`;
+
+  const lowerMsg = (msg ?? '').toLowerCase();
+  if (
+    providerName === 'OpenRouter' &&
+    (status === 402 || lowerMsg.includes('insufficient credits') || lowerMsg.includes('never purchased credits'))
+  ) {
+    return 'OpenRouter rejected this request for billing/credit reasons. Use an explicit :free model (for example meta-llama/llama-3.1-8b-instruct:free) in Settings. If it still fails, this OpenRouter account/org requires a credit purchase before API access.';
+  }
+
   return msg ?? `${providerName} API error: ${status}`;
 }
 
@@ -294,6 +322,60 @@ async function streamOpenAI(
   callbacks.onDone();
 }
 
+// ─── OpenRouter ──────────────────────────────────────────────────────────────
+
+async function streamOpenRouter(
+  messages: LLMMessage[],
+  systemPrompt: string,
+  config: LLMConfig,
+  callbacks: StreamCallbacks
+): Promise<void> {
+  const openRouterMessages = [
+    { role: 'system', content: systemPrompt },
+    ...messages.map((m) => ({ role: m.role, content: m.content })),
+  ];
+
+  const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${config.apiKey}`,
+      'HTTP-Referer': 'https://jobbuddy-ai.local',
+      'X-Title': 'JobBuddy AI',
+    },
+    body: JSON.stringify({
+      model: config.model,
+      max_tokens: 4096,
+      stream: true,
+      messages: openRouterMessages,
+    }),
+  });
+
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    callbacks.onError(handleHttpError(response.status, body, 'OpenRouter'));
+    return;
+  }
+
+  await readSSE(
+    response,
+    (data) => {
+      try {
+        const parsed = JSON.parse(data) as {
+          choices?: { delta?: { content?: string }; finish_reason?: string | null }[];
+        };
+        const content = parsed.choices?.[0]?.delta?.content;
+        if (content) callbacks.onChunk(content);
+      } catch {
+        // skip
+      }
+    },
+    callbacks
+  );
+
+  callbacks.onDone();
+}
+
 // ─── Unified entry point ──────────────────────────────────────────────────────
 
 export async function streamLLMResponse(
@@ -312,6 +394,9 @@ export async function streamLLMResponse(
         break;
       case 'openai':
         await streamOpenAI(messages, systemPrompt, config, callbacks);
+        break;
+      case 'openrouter':
+        await streamOpenRouter(messages, systemPrompt, config, callbacks);
         break;
       default:
         callbacks.onError(`Unknown provider: ${(config as LLMConfig).provider}`);

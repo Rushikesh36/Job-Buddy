@@ -29,3 +29,23 @@ export interface EmailDetectionResult {
   isEmailLike: boolean;
   draft: EmailDraft;
 }
+
+export type OutreachEmailType =
+  | 'cold-recruiter'
+  | 'follow-up'
+  | 'linkedin-connection'
+  | 'linkedin-post-connection'
+  | 'thank-you-post-interview'
+  | 'networking-informational'
+  | 'referral-request';
+
+export interface GeneratedEmailRecord {
+  id: string;
+  createdAt: string;
+  type: OutreachEmailType;
+  company?: string;
+  role?: string;
+  to: string;
+  subject: string;
+  source: 'scanner' | 'manual' | 'chat';
+}

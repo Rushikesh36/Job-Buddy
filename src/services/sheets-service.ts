@@ -17,6 +17,26 @@ interface ValuesResponse {
   values?: string[][];
 }
 
+export type AppliedJobLookup = Record<string, true>;
+
+function normalizeLookupPart(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function buildLookupKeys(parts: { jobId?: string; jobUrl?: string; title?: string; company?: string }): string[] {
+  const keys: string[] = [];
+  const jobId = normalizeLookupPart(parts.jobId ?? '');
+  const jobUrl = normalizeLookupPart(parts.jobUrl ?? '');
+  const title = normalizeLookupPart(parts.title ?? '');
+  const company = normalizeLookupPart(parts.company ?? '');
+
+  if (jobId) keys.push(`id:${jobId}`);
+  if (jobUrl && jobUrl !== 'n/a') keys.push(`url:${jobUrl}`);
+  if (title && company) keys.push(`tc:${title}::${company}`);
+
+  return keys;
+}
+
 function getStorage<T>(keys: string[]): Promise<Record<string, T>> {
   return new Promise((resolve) => {
     chrome.storage.local.get(keys, (result) => resolve(result as Record<string, T>));
@@ -271,4 +291,40 @@ export async function markJobAsEmailed(args: {
   });
 
   return true;
+}
+
+export async function loadAppliedJobLookup(args: {
+  clientId: string;
+  clientSecret?: string;
+  spreadsheetId: string;
+}): Promise<AppliedJobLookup> {
+  const accessToken = await getValidGoogleAccessToken(args.clientId, args.clientSecret);
+  await ensureSheetAndHeaders(accessToken, args.spreadsheetId);
+
+  const rows = await googleFetch<ValuesResponse>({
+    accessToken,
+    url: `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(args.spreadsheetId)}/values/${encodeURIComponent(`${SHEET_NAME}!A2:M`)}`,
+  });
+
+  const appliedLookup: AppliedJobLookup = {};
+  const values = rows.values ?? [];
+
+  for (const row of values) {
+    const status = normalizeLookupPart(row[11] ?? 'saved');
+    const isApplied = status === 'applied' || status === 'interviewing' || status === 'rejected' || status === 'offer';
+    if (!isApplied) continue;
+
+    const keys = buildLookupKeys({
+      title: row[2] ?? '',
+      company: row[1] ?? '',
+      jobId: row[4] ?? '',
+      jobUrl: row[5] ?? '',
+    });
+
+    for (const key of keys) {
+      appliedLookup[key] = true;
+    }
+  }
+
+  return appliedLookup;
 }

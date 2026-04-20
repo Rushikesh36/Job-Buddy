@@ -1,12 +1,23 @@
 import { useState } from 'react';
-import type { EmailDraft } from '../../types/email';
+import type { EmailDraft, OutreachEmailType } from '../../types/email';
+import EmailTypeSelector from './EmailTypeSelector';
+import EmailPreview from './EmailPreview';
 
 interface EmailComposeModalProps {
   isOpen: boolean;
   draft: EmailDraft | null;
   resumeVersions: string[];
+  emailType: OutreachEmailType;
+  emailTypeConfidence?: number | null;
+  recipientSuggestions?: string[];
   isBusy: boolean;
   onClose: () => void;
+  onEmailTypeChange: (type: OutreachEmailType) => void;
+  onRegenerate: () => void;
+  onMakeShorter: () => void;
+  onMakeLonger: () => void;
+  onMoreFormal: () => void;
+  onMoreCasual: () => void;
   onChange: (draft: EmailDraft) => void;
   onSend: () => void;
   onSaveDraft: () => void;
@@ -16,8 +27,17 @@ export default function EmailComposeModal({
   isOpen,
   draft,
   resumeVersions,
+  emailType,
+  emailTypeConfidence,
+  recipientSuggestions = [],
   isBusy,
   onClose,
+  onEmailTypeChange,
+  onRegenerate,
+  onMakeShorter,
+  onMakeLonger,
+  onMoreFormal,
+  onMoreCasual,
   onChange,
   onSend,
   onSaveDraft,
@@ -47,6 +67,23 @@ export default function EmailComposeModal({
         </div>
 
         <div className="space-y-3 px-4 py-4">
+          <EmailTypeSelector
+            value={emailType}
+            confidence={emailTypeConfidence}
+            disabled={isBusy}
+            onChange={onEmailTypeChange}
+          />
+
+          <EmailPreview
+            draft={draft}
+            disabled={isBusy}
+            onRegenerate={onRegenerate}
+            onMakeShorter={onMakeShorter}
+            onMakeLonger={onMakeLonger}
+            onMoreFormal={onMoreFormal}
+            onMoreCasual={onMoreCasual}
+          />
+
           <label className="block">
             <span className="mb-1 block text-xs font-medium text-gray-700">To</span>
             <input
@@ -55,6 +92,27 @@ export default function EmailComposeModal({
               placeholder="recruiter@company.com"
               className="w-full rounded-lg border border-gray-200 px-3 py-2 text-xs outline-none focus:border-blue-400 focus:ring-1 focus:ring-blue-400"
             />
+            {recipientSuggestions.length > 0 && (
+              <div className="mt-2">
+                <p className="text-[11px] text-gray-500">Suggested from job page:</p>
+                <div className="mt-1 flex flex-wrap gap-1.5">
+                  {recipientSuggestions.map((email) => (
+                    <button
+                      key={email}
+                      type="button"
+                      onClick={() => update('to', email)}
+                      className={`rounded-full border px-2 py-0.5 text-[11px] ${
+                        draft.to.trim().toLowerCase() === email.toLowerCase()
+                          ? 'border-blue-300 bg-blue-50 text-blue-700'
+                          : 'border-gray-300 bg-white text-gray-700 hover:bg-gray-50'
+                      }`}
+                    >
+                      {email}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
           </label>
 
           <button

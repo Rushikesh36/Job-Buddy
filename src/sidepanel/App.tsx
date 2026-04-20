@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import type { ChangeEvent } from 'react';
 import type {
   ChatMessage,
@@ -13,6 +13,7 @@ import type {
 } from '../lib/types';
 import { DEFAULT_PROVIDER_SETTINGS, DEFAULT_GOOGLE_AUTH_STATE, DEFAULT_GOOGLE_SETTINGS } from '../lib/types';
 import { PROVIDER_META } from '../lib/llm-api';
+import { MY_PROFILE } from '../lib/profile';
 import {
   connectGoogleAccount,
   disconnectGoogleAccount,
@@ -24,20 +25,22 @@ import {
 import {
   appendJobToSheet,
   createNewSpreadsheetWithSecret,
+  loadAppliedJobLookup,
   loadSheetsConfig,
   markJobAsEmailed,
   normalizeSpreadsheetId,
   saveSheetsConfig,
+  type AppliedJobLookup,
 } from '../services/sheets-service';
 import { buildJobHuntSummary, loadActivityStore, recordApplication, recordOutreach, saveActivityStore, type ActivityStore } from '../services/activity-service';
 import { buildJobExtractionPrompt, toJobDraft } from '../prompts/job-extractor';
 import type { JobData, SheetsConfig } from '../types/job';
 import { DEFAULT_SHEETS_CONFIG } from '../types/job';
-import { detectEmailDraft } from '../services/gmail-service';
-import type { EmailDraft } from '../types/email';
+import { detectEmailDraft, extractEmailCandidates, saveGmailDraft, sendEmailViaGmail } from '../services/gmail-service';
+import type { EmailDraft, OutreachEmailType } from '../types/email';
 import { buildConversationSummaryPrompt } from '../prompts/summarizer';
 import { buildPreferenceExtractionPrompt } from '../prompts/preference-extractor';
-import { buildRecruiterExtractionPrompt, parseRecruiterInfo, buildColdEmailBody } from '../prompts/recruiter-extractor';
+import { generateSmartEmailDraft } from '../services/email-generator';
 import {
   applyMemoryLimits,
   createMemoryBackupPayload,
@@ -58,6 +61,40 @@ import {
 } from '../services/memory-service';
 import type { MemorySettings, MemoryStore, PromptMemoryContext } from '../types/memory';
 import { DEFAULT_MEMORY_SETTINGS, DEFAULT_MEMORY_STORE } from '../types/memory';
+import type {
+  NUworksDetectionResult,
+  NUworksEnrichProgress,
+  NUworksPageExtractionResult,
+  RawJobListing,
+  NUworksScanProgress,
+  ScanCache,
+  ScoredJob,
+  ScoringProgress,
+} from '../types/scanner';
+import { SCANNER_DEBUG_MODE_STORAGE_KEY } from '../types/scanner';
+import { scoreJobsInBatches } from '../services/job-scorer';
+import {
+  buildScanCache,
+  getJobCacheKey,
+  loadScanCache,
+  markJobsByCache,
+  saveScanCache,
+} from '../services/scan-cache';
+import {
+  filterOutFullyProcessedJobs,
+  markJobsScanned,
+  markJobsShortlisted,
+} from '../services/processed-job-registry';
+import {
+  clearScannerShortlist,
+  loadScannerShortlist,
+  saveScannerShortlist,
+} from '../services/scanner-shortlist';
+import {
+  loadScannerState,
+  saveScannerState,
+  clearScannerState,
+} from '../services/scanner-state-persistence';
 import ChatWindow from './components/ChatWindow';
 import InputBar from './components/InputBar';
 import PageContextBanner from './components/PageContextBanner';
@@ -65,8 +102,9 @@ import GoogleConnectButton from './components/GoogleConnectButton';
 import JobSaveModal from './components/JobSaveModal';
 import EmailComposeModal from './components/EmailComposeModal';
 import MemoryPanel from './components/MemoryPanel';
+import ScannerTab from './components/scanner/ScannerTab';
 
-const PROVIDERS: LLMProvider[] = ['claude', 'gemini', 'openai'];
+const PROVIDERS: LLMProvider[] = ['claude', 'gemini', 'openai', 'openrouter'];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -77,7 +115,22 @@ function generateId() {
 function loadSettings(): Promise<ProviderSettings> {
   return new Promise((resolve) => {
     chrome.storage.local.get(['providerSettings'], (result) => {
-      resolve((result.providerSettings as ProviderSettings) ?? DEFAULT_PROVIDER_SETTINGS);
+      const raw = (result.providerSettings as Partial<ProviderSettings>) ?? DEFAULT_PROVIDER_SETTINGS;
+      const selectedProvider = PROVIDERS.includes(raw.selectedProvider as LLMProvider)
+        ? (raw.selectedProvider as LLMProvider)
+        : DEFAULT_PROVIDER_SETTINGS.selectedProvider;
+
+      resolve({
+        selectedProvider,
+        apiKeys: {
+          ...DEFAULT_PROVIDER_SETTINGS.apiKeys,
+          ...(raw.apiKeys ?? {}),
+        },
+        selectedModels: {
+          ...DEFAULT_PROVIDER_SETTINGS.selectedModels,
+          ...(raw.selectedModels ?? {}),
+        },
+      });
     });
   });
 }
@@ -88,9 +141,308 @@ function saveSettings(settings: ProviderSettings): Promise<void> {
   });
 }
 
+function loadScannerDebugMode(): Promise<boolean> {
+  return new Promise((resolve) => {
+    chrome.storage.local.get([SCANNER_DEBUG_MODE_STORAGE_KEY], (result) => {
+      resolve(Boolean(result[SCANNER_DEBUG_MODE_STORAGE_KEY]));
+    });
+  });
+}
+
+function saveScannerDebugMode(enabled: boolean): Promise<void> {
+  return new Promise((resolve) => {
+    chrome.storage.local.set({ [SCANNER_DEBUG_MODE_STORAGE_KEY]: enabled }, resolve);
+  });
+}
+
+function toScannerJobData(job: RawJobListing | ScoredJob, resumeVersion: string): JobData {
+  const scored = 'matchScore' in job;
+  const baseNotes = scored
+    ? [
+        `Scanner Match Score: ${job.matchScore}/10`,
+        `Match Reason: ${job.matchReason || 'N/A'}`,
+        `Matching Skills: ${(job.matchingSkills || []).join(', ') || 'N/A'}`,
+        `Missing Skills: ${(job.missingSkills || []).join(', ') || 'N/A'}`,
+        `Visa Flag: ${job.visaFlag || 'yellow'}`,
+      ].join(' | ')
+    : 'Saved from NUworks scanner';
+
+  return {
+    dateApplied: new Date().toISOString(),
+    company: job.company || 'N/A',
+    role: job.title || 'N/A',
+    location: job.location || 'N/A',
+    jobId: job.jobId || 'N/A',
+    jobUrl: job.detailUrl || 'N/A',
+    keyRequirements: scored ? (job.matchingSkills || []).slice(0, 5) : [],
+    salaryRange: 'N/A',
+    visaSponsorship: 'Unknown',
+    atsScore: scored ? job.matchScore : 0,
+    resumeVersion,
+    status: 'Saved',
+    notes: baseNotes,
+  };
+}
+
+function toCsvValue(value: string): string {
+  const escaped = value.replace(/"/g, '""');
+  return `"${escaped}"`;
+}
+
+function exportScannerJobsCsv(jobs: Array<RawJobListing | ScoredJob>): void {
+  const headers = [
+    'Title',
+    'Company',
+    'Location',
+    'Job ID',
+    'Detail URL',
+    'Match Score',
+    'Match Reason',
+    'Matching Skills',
+    'Missing Skills',
+    'Visa Flag',
+    'Is New',
+  ];
+
+  const rows = jobs.map((job) => {
+    const scored = 'matchScore' in job;
+    return [
+      job.title || '',
+      job.company || '',
+      job.location || '',
+      job.jobId || '',
+      job.detailUrl || '',
+      scored ? String(job.matchScore) : '',
+      scored ? job.matchReason || '' : '',
+      scored ? (job.matchingSkills || []).join('; ') : '',
+      scored ? (job.missingSkills || []).join('; ') : '',
+      scored ? job.visaFlag || '' : '',
+      job.isNew ? 'YES' : 'NO',
+    ].map((value) => toCsvValue(value));
+  });
+
+  const csv = [headers.map((value) => toCsvValue(value)).join(','), ...rows.map((row) => row.join(','))].join('\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = `nuworks-scan-${new Date().toISOString().slice(0, 10)}.csv`;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
+function normalizeScannerLookupPart(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function normalizeUrlForLookup(value: string): string {
+  const raw = value.trim();
+  if (!raw) return '';
+
+  try {
+    const parsed = new URL(raw);
+    const normalizedPath = parsed.pathname.replace(/\/+$/, '');
+    return `${parsed.origin.toLowerCase()}${normalizedPath.toLowerCase()}`;
+  } catch {
+    return raw.toLowerCase().split('#')[0].split('?')[0].replace(/\/+$/, '');
+  }
+}
+
+function getScannerLookupKeys(job: RawJobListing | ScoredJob): string[] {
+  const keys: string[] = [];
+  const jobId = normalizeScannerLookupPart(job.jobId ?? '');
+  const detailUrl = normalizeScannerLookupPart(job.detailUrl ?? '');
+  const title = normalizeScannerLookupPart(job.title ?? '');
+  const company = normalizeScannerLookupPart(job.company ?? '');
+
+  if (jobId) keys.push(`id:${jobId}`);
+  if (detailUrl && detailUrl !== 'n/a') keys.push(`url:${detailUrl}`);
+  if (title && company) keys.push(`tc:${title}::${company}`);
+
+  return keys;
+}
+
+function isJobApplied(job: RawJobListing | ScoredJob, lookup: AppliedJobLookup): boolean {
+  const keys = getScannerLookupKeys(job);
+  return keys.some((key) => Boolean(lookup[key]));
+}
+
+function applyAppliedStatus<T extends RawJobListing | ScoredJob>(jobs: T[], lookup: AppliedJobLookup): T[] {
+  return jobs.map((job) => ({
+    ...job,
+    appliedStatus: isJobApplied(job, lookup) ? 'applied' : 'not-applied',
+  }));
+}
+
+type ScannerDateFilter = 'all' | '24h' | '3d' | '7d';
+const PROFILE_FIT_SCORE_THRESHOLD = 7;
+const PROFILE_FIT_RELAXED_SCORE_THRESHOLD = 5;
+const PROFILE_FIT_RELAXED_LIMIT = 10;
+const PROFILE_FIT_NON_RED_FALLBACK_LIMIT = 5;
+
+const SCANNER_HARD_EXCLUDE_PATTERNS: RegExp[] = [
+  /\bnot\s+qualified\b/i,
+  /\bus\s+citizen(ship)?\s+(required|only)\b/i,
+  /\bcitizens?\s+only\b/i,
+  /\bmust\s+be\s+(a\s+)?u\.?s\.?\s+citizen\b/i,
+  /\bunpaid\b/i,
+  /\bno\s+compensation\b/i,
+  /\bwithout\s+compensation\b/i,
+  /\bvolunteer\b/i,
+];
+
+function hasScannerHardExclusion(text: string): boolean {
+  if (!text) return false;
+  return SCANNER_HARD_EXCLUDE_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function filterJobsByEligibility<T extends RawJobListing | ScoredJob>(jobs: T[]): T[] {
+  return jobs.filter((job) => {
+    const combinedText = [
+      job.title,
+      job.company,
+      job.location,
+      job.postingDate,
+      job.deadline,
+      job.jobType,
+      job.description,
+      job.rawText,
+    ].filter(Boolean).join(' | ');
+
+    return !hasScannerHardExclusion(combinedText);
+  });
+}
+
+function isPaidJob(job: RawJobListing | ScoredJob): boolean {
+  const combinedText = [
+    job.title,
+    job.company,
+    job.location,
+    job.postingDate,
+    job.deadline,
+    job.jobType,
+    job.description,
+    job.rawText,
+  ].filter(Boolean).join(' | ');
+
+  return !hasScannerHardExclusion(combinedText);
+}
+
+function filterScoredByProfileFit(jobs: ScoredJob[]): ScoredJob[] {
+  const passed = jobs.filter((job) => job.matchScore >= PROFILE_FIT_SCORE_THRESHOLD && job.visaFlag !== 'red' && isPaidJob(job));
+  const filtered = jobs.length - passed.length;
+  if (filtered > 0) {
+    console.log(`[ProfileFit] Filtered out ${filtered} jobs:`);
+    jobs.forEach((job) => {
+      const scoreOk = job.matchScore >= PROFILE_FIT_SCORE_THRESHOLD;
+      const visaOk = job.visaFlag !== 'red';
+      const paidOk = isPaidJob(job);
+      if (!scoreOk || !visaOk || !paidOk) {
+        console.log(`  - ${job.company} / ${job.title}: score=${job.matchScore}(${scoreOk?'✓':'✗'}) visa=${job.visaFlag}(${visaOk?'✓':'✗'}) paid=${paidOk?'✓':'✗'}`);
+      }
+    });
+  }
+  return passed;
+}
+
+type ProfileFitSelectionMode = 'strict' | 'relaxed' | 'non-red-fallback';
+
+function selectProfileFitJobs(jobs: ScoredJob[]): { jobs: ScoredJob[]; mode: ProfileFitSelectionMode } {
+  const strict = filterScoredByProfileFit(jobs);
+  return { jobs: strict, mode: 'strict' };
+}
+
+function parseRelativeDate(text: string, nowMs: number): Date | null {
+  const value = text.toLowerCase();
+  if (/(just posted|today|posted today)/i.test(value)) return new Date(nowMs);
+  if (/(yesterday|posted yesterday)/i.test(value)) return new Date(nowMs - 24 * 60 * 60 * 1000);
+
+  // NUworks commonly renders compact ages like "1d", "2d", "12h".
+  const compactMatch = value.match(/\b(\d+)\s*(h|hr|hrs|d|w|m)\b/i);
+  if (compactMatch) {
+    const amount = Number.parseInt(compactMatch[1], 10);
+    const unit = compactMatch[2].toLowerCase();
+    if (Number.isFinite(amount)) {
+      if (unit === 'h' || unit === 'hr' || unit === 'hrs') {
+        return new Date(nowMs - amount * 60 * 60 * 1000);
+      }
+      if (unit === 'd') {
+        return new Date(nowMs - amount * 24 * 60 * 60 * 1000);
+      }
+      if (unit === 'w') {
+        return new Date(nowMs - amount * 7 * 24 * 60 * 60 * 1000);
+      }
+      if (unit === 'm') {
+        return new Date(nowMs - amount * 30 * 24 * 60 * 60 * 1000);
+      }
+    }
+  }
+
+  const hoursMatch = value.match(/(\d+)\s*(hour|hours|hr|hrs)\s*ago/i);
+  if (hoursMatch) {
+    const hours = Number.parseInt(hoursMatch[1], 10);
+    if (Number.isFinite(hours)) return new Date(nowMs - hours * 60 * 60 * 1000);
+  }
+
+  const daysMatch = value.match(/(\d+)\s*(day|days)\s*ago/i);
+  if (daysMatch) {
+    const days = Number.parseInt(daysMatch[1], 10);
+    if (Number.isFinite(days)) return new Date(nowMs - days * 24 * 60 * 60 * 1000);
+  }
+
+  return null;
+}
+
+function parseDateCandidate(value: string, nowMs: number): Date | null {
+  const raw = value.trim();
+  if (!raw) return null;
+
+  const direct = new Date(raw);
+  if (Number.isFinite(direct.getTime())) return direct;
+
+  return parseRelativeDate(raw, nowMs);
+}
+
+function extractPostingDate(job: RawJobListing | ScoredJob, nowMs: number): Date | null {
+  const posting = parseDateCandidate(job.postingDate, nowMs);
+  if (posting) return posting;
+
+  const textCandidates = [job.rawText, job.description].filter(Boolean);
+  for (const text of textCandidates) {
+    const postedHint = text.match(/(?:posted(?:\s+on)?|posting\s*date|date\s*posted)\s*[:\-]?\s*([^\n|,;]{3,40})/i);
+    if (postedHint?.[1]) {
+      const hinted = parseDateCandidate(postedHint[1], nowMs);
+      if (hinted) return hinted;
+    }
+
+    const relative = parseRelativeDate(text, nowMs);
+    if (relative) return relative;
+  }
+
+  return null;
+}
+
+function filterJobsByDate<T extends RawJobListing | ScoredJob>(jobs: T[], filter: ScannerDateFilter, nowMs = Date.now()): T[] {
+  const eligibleJobs = filterJobsByEligibility(jobs);
+  if (filter === 'all') return eligibleJobs;
+
+  const windowMs = filter === '24h'
+    ? 24 * 60 * 60 * 1000
+    : filter === '3d'
+      ? 3 * 24 * 60 * 60 * 1000
+      : 7 * 24 * 60 * 60 * 1000;
+
+  return eligibleJobs.filter((job) => {
+    const postedAt = extractPostingDate(job, nowMs);
+    if (!postedAt) return false;
+    const age = nowMs - postedAt.getTime();
+    return age <= windowMs;
+  });
+}
+
 // ─── App ──────────────────────────────────────────────────────────────────────
 
-type View = 'chat' | 'memory' | 'settings';
+type View = 'chat' | 'scanner' | 'memory' | 'settings';
 type ToastType = 'success' | 'error';
 interface ToastState {
   type: ToastType;
@@ -99,16 +451,98 @@ interface ToastState {
   linkLabel?: string;
 }
 
+interface EmailGenerationSeed {
+  userIntentText: string;
+  source: 'scanner' | 'manual' | 'chat';
+  pageTitle?: string;
+  pageUrl?: string;
+  pageText?: string;
+  companyName?: string;
+  roleTitle?: string;
+  recruiterName?: string;
+  recipientCandidates?: string[];
+  chatContext?: string;
+  memoryContext?: string;
+  resumeVersion?: string;
+}
+
 export default function App() {
   // ── state ──
   const [view, setView] = useState<View>('chat');
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputValue, setInputValue] = useState('');
   const [pageContext, setPageContext] = useState<PageContext | null>(null);
+  const [nuworksDetection, setNuworksDetection] = useState<NUworksDetectionResult | null>(null);
+  const [nuworksCurrentPageJobs, setNuworksCurrentPageJobs] = useState<NUworksPageExtractionResult | null>(null);
+  const [nuworksScanProgress, setNuworksScanProgress] = useState<NUworksScanProgress | null>(null);
+  const [nuworksEnrichProgress, setNuworksEnrichProgress] = useState<NUworksEnrichProgress | null>(null);
+  const [nuworksScoredJobs, setNuworksScoredJobs] = useState<ScoredJob[]>([]);
+  const [scannerScoringProgress, setScannerScoringProgress] = useState<ScoringProgress | null>(null);
+  const [scanCache, setScanCache] = useState<ScanCache | null>(null);
+  const [scanNewOnly, setScanNewOnly] = useState(false);
+  const [showProfileFitOnly, setShowProfileFitOnly] = useState(true);
+  const [scannerDateFilter, setScannerDateFilter] = useState<ScannerDateFilter>('all');
+  const [newJobsCount, setNewJobsCount] = useState(0);
+  const [processedSkipCount, setProcessedSkipCount] = useState(0);
+  const [appliedJobLookup, setAppliedJobLookup] = useState<AppliedJobLookup>({});
+  const [profileFitPageIndex, setProfileFitPageIndex] = useState(0);
+  const [allJobsPageIndex, setAllJobsPageIndex] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
   const [isReadingPage, setIsReadingPage] = useState(false);
+  const [isScanningAllPages, setIsScanningAllPages] = useState(false);
+  const [isEnrichingJobs, setIsEnrichingJobs] = useState(false);
+  const [isScoringJobs, setIsScoringJobs] = useState(false);
+  const [isSavingScannerJobs, setIsSavingScannerJobs] = useState(false);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const [toast, setToast] = useState<ToastState | null>(null);
+  const [scannerDebugMode, setScannerDebugMode] = useState(false);
+  const scannerActionBusy = isScanningAllPages || isEnrichingJobs || isScoringJobs || isSavingScannerJobs;
+
+  const getDateFilteredJobs = useCallback(
+    <T extends RawJobListing | ScoredJob>(jobs: T[]): T[] => filterJobsByDate(jobs, scannerDateFilter),
+    [scannerDateFilter]
+  );
+
+  const currentPageJobsWithApplied = useMemo(() => {
+    if (!nuworksCurrentPageJobs) return null;
+    return {
+      ...nuworksCurrentPageJobs,
+      jobs: applyAppliedStatus(nuworksCurrentPageJobs.jobs, appliedJobLookup),
+    };
+  }, [nuworksCurrentPageJobs, appliedJobLookup]);
+
+  const scoredJobsWithApplied = useMemo(
+    () => applyAppliedStatus(nuworksScoredJobs, appliedJobLookup),
+    [nuworksScoredJobs, appliedJobLookup]
+  );
+
+  const filteredCurrentPageJobs = useMemo(() => {
+    if (!currentPageJobsWithApplied) return null;
+    return {
+      ...currentPageJobsWithApplied,
+      jobs: getDateFilteredJobs(currentPageJobsWithApplied.jobs),
+    };
+  }, [currentPageJobsWithApplied, getDateFilteredJobs]);
+
+  const allScoredJobs = useMemo(
+    () => getDateFilteredJobs(scoredJobsWithApplied),
+    [getDateFilteredJobs, scoredJobsWithApplied]
+  );
+
+  const profileFitJobs = useMemo(
+    () => selectProfileFitJobs(allScoredJobs).jobs,
+    [allScoredJobs]
+  );
+
+  // Monitor scored jobs state
+  useEffect(() => {
+    console.log('[State Monitor] Scored jobs state:', {
+      nuworksScoredJobs: nuworksScoredJobs.length,
+      allScoredJobs: allScoredJobs.length,
+      profileFitJobs: profileFitJobs.length,
+      dateFilter: scannerDateFilter,
+    });
+  }, [nuworksScoredJobs, allScoredJobs, profileFitJobs, scannerDateFilter]);
 
   // provider settings (persisted)
   const [providerSettings, setProviderSettings] = useState<ProviderSettings>(DEFAULT_PROVIDER_SETTINGS);
@@ -116,8 +550,19 @@ export default function App() {
   // settings-view local state
   const [settingsTab, setSettingsTab] = useState<LLMProvider>('claude');
   // per-provider key inputs (draft values, not saved yet)
-  const [keyInputs, setKeyInputs] = useState<Record<LLMProvider, string>>({ claude: '', gemini: '', openai: '' });
+  const [keyInputs, setKeyInputs] = useState<Record<LLMProvider, string>>({
+    claude: '',
+    gemini: '',
+    openai: '',
+    openrouter: '',
+  });
   const [keyVisible, setKeyVisible] = useState<LLMProvider | null>(null);
+  const [customModelInputs, setCustomModelInputs] = useState<Record<LLMProvider, string>>({
+    claude: '',
+    gemini: '',
+    openai: '',
+    openrouter: '',
+  });
   const [googleSettings, setGoogleSettingsState] = useState<GoogleSettings>(DEFAULT_GOOGLE_SETTINGS);
   const [googleClientIdInput, setGoogleClientIdInput] = useState('');
   const [googleClientSecretInput, setGoogleClientSecretInput] = useState('');
@@ -135,6 +580,16 @@ export default function App() {
   const [emailDraft, setEmailDraft] = useState<EmailDraft | null>(null);
   const [isEmailComposeOpen, setIsEmailComposeOpen] = useState(false);
   const [isEmailBusy, setIsEmailBusy] = useState(false);
+  const [emailGenerationSeed, setEmailGenerationSeed] = useState<EmailGenerationSeed | null>(null);
+  const [selectedEmailType, setSelectedEmailType] = useState<OutreachEmailType>('cold-recruiter');
+  const [emailTypeConfidence, setEmailTypeConfidence] = useState<number | null>(null);
+  const recipientSuggestions = useMemo(() => {
+    const pageEmails = extractEmailCandidates(pageContext?.textContent);
+    const draftEmails = extractEmailCandidates(emailDraft?.body);
+    const merged = [...pageEmails, ...draftEmails];
+    return Array.from(new Set(merged)).slice(0, 8);
+  }, [pageContext?.textContent, emailDraft?.body]);
+
   const [memoryStore, setMemoryStore] = useState<MemoryStore>(DEFAULT_MEMORY_STORE);
   const [memorySettings, setMemorySettingsState] = useState<MemorySettings>(DEFAULT_MEMORY_SETTINGS);
   const [loadedMemoryCount, setLoadedMemoryCount] = useState(0);
@@ -151,6 +606,26 @@ export default function App() {
   // Synchronous guard against double-sends before React re-renders with isLoading:true
   const isSendingRef = useRef(false);
 
+  const refreshAppliedJobLookup = useCallback(async () => {
+    const clientId = googleSettings.clientId.trim();
+    const spreadsheetId = sheetsConfig.spreadsheetId;
+    if (!googleAuthState.isConnected || !clientId || !spreadsheetId) {
+      setAppliedJobLookup({});
+      return;
+    }
+
+    try {
+      const lookup = await loadAppliedJobLookup({
+        clientId,
+        clientSecret: googleSettings.clientSecret,
+        spreadsheetId,
+      });
+      setAppliedJobLookup(lookup);
+    } catch {
+      setAppliedJobLookup({});
+    }
+  }, [googleAuthState.isConnected, googleSettings.clientId, googleSettings.clientSecret, sheetsConfig.spreadsheetId]);
+
   // ── on mount: load settings ──
   useEffect(() => {
     Promise.all([
@@ -162,6 +637,7 @@ export default function App() {
       loadMemorySettings(),
       getLastDailyMemoryBackupDate(),
       loadActivityStore(),
+      loadScannerDebugMode(),
     ]).then(
       ([
         settings,
@@ -172,9 +648,11 @@ export default function App() {
         storedMemorySettings,
         storedLastDailyBackupDate,
         storedActivityStore,
+        storedScannerDebugMode,
       ]) => {
         setProviderSettings(settings);
         setSettingsTab(settings.selectedProvider);
+        setCustomModelInputs(settings.selectedModels);
         setGoogleSettingsState(storedGoogleSettings);
         setGoogleClientIdInput(storedGoogleSettings.clientId);
         setGoogleClientSecretInput(storedGoogleSettings.clientSecret ?? '');
@@ -185,12 +663,91 @@ export default function App() {
         setMemorySettingsState(storedMemorySettings);
         setLastDailyBackupDate(storedLastDailyBackupDate);
         setActivityStore(storedActivityStore);
+        setScannerDebugMode(storedScannerDebugMode);
         hasHydratedMemoryRef.current = true;
         const activeKey = settings.apiKeys[settings.selectedProvider];
         if (!activeKey) setView('settings');
       }
     );
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const hydrateScannerState = async () => {
+      const [cached, shortlistCache, persistedState] = await Promise.all([
+        loadScanCache(),
+        loadScannerShortlist(),
+        loadScannerState(),
+      ]);
+      
+      if (!cancelled) {
+        setScanCache(cached);
+        
+        // Load persisted scanned and scored jobs
+        if (persistedState) {
+          if (persistedState.scannedJobs?.length) {
+            setNuworksCurrentPageJobs(
+              persistedState.currentPageExtraction || {
+                jobs: persistedState.scannedJobs,
+                diagnostics: {
+                  strategyUsed: 'structured',
+                  attemptedStrategies: ['structured'],
+                  structuredCandidates: persistedState.scannedJobs.length,
+                  textPatternCandidates: 0,
+                  deduplicatedCount: persistedState.scannedJobs.length,
+                  skippedEmptyTitleCount: 0,
+                },
+                llmFallbackInput: {
+                  pageUrl: 'restored',
+                  pageTitle: 'Restored Scanned Jobs',
+                  pageTextSample: '',
+                },
+                extractedAt: new Date().toISOString(),
+              }
+            );
+          }
+          
+          if (persistedState.scoredJobs?.length) {
+            setNuworksScoredJobs(persistedState.scoredJobs);
+          }
+        }
+        
+        // Also check shortlist cache for backwards compatibility
+        if (shortlistCache?.jobs?.length) {
+          void markJobsShortlisted(shortlistCache.jobs);
+          setNuworksScoredJobs(shortlistCache.jobs);
+          setNuworksCurrentPageJobs({
+            jobs: shortlistCache.jobs,
+            diagnostics: {
+              strategyUsed: 'structured',
+              attemptedStrategies: ['structured'],
+              structuredCandidates: shortlistCache.jobs.length,
+              textPatternCandidates: 0,
+              deduplicatedCount: shortlistCache.jobs.length,
+              skippedEmptyTitleCount: 0,
+            },
+            llmFallbackInput: {
+              pageUrl: shortlistCache.sourceUrl,
+              pageTitle: 'Saved Apply List',
+              pageTextSample: '',
+            },
+            extractedAt: shortlistCache.createdAt,
+          });
+        }
+      }
+    };
+
+    void hydrateScannerState();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    void refreshAppliedJobLookup();
+  }, [refreshAppliedJobLookup]);
 
   useEffect(() => {
     if (!hasHydratedMemoryRef.current) return;
@@ -289,6 +846,18 @@ export default function App() {
           return prev;
         });
       }
+
+      if (message.type === 'SCAN_PROGRESS') {
+        const payload = message.payload as { data?: NUworksScanProgress };
+        if (!payload?.data) return;
+        setNuworksScanProgress(payload.data);
+      }
+
+      if (message.type === 'ENRICH_PROGRESS') {
+        const payload = message.payload as { data?: NUworksEnrichProgress };
+        if (!payload?.data) return;
+        setNuworksEnrichProgress(payload.data);
+      }
     };
 
     chrome.runtime.onMessage.addListener(handler);
@@ -296,21 +865,198 @@ export default function App() {
   }, []);
 
   // ── actions ──
-  const handleReadPage = useCallback(() => {
-    setIsReadingPage(true);
-    setErrorBanner(null);
-    chrome.runtime.sendMessage({ type: 'GET_PAGE_CONTENT' }, (response) => {
-      setIsReadingPage(false);
-      if (chrome.runtime.lastError || !response?.success) {
-        setErrorBanner(
-          response?.error ?? chrome.runtime.lastError?.message ?? "Couldn't read this page."
-        );
-        return;
-      }
-      const data = response.data as PageContext;
-      setPageContext(data);
+  const readActivePageContext = useCallback(() => {
+    return new Promise<PageContext>((resolve, reject) => {
+      chrome.runtime.sendMessage({ type: 'GET_PAGE_CONTENT' }, (response) => {
+        if (chrome.runtime.lastError || !response?.success || !response?.data) {
+          reject(new Error(response?.error ?? chrome.runtime.lastError?.message ?? "Couldn't read this page."));
+          return;
+        }
+
+        resolve(response.data as PageContext);
+      });
     });
   }, []);
+
+  const handleReadPage = useCallback(async () => {
+    setIsReadingPage(true);
+    setErrorBanner(null);
+    setNuworksDetection(null);
+    setNuworksCurrentPageJobs(null);
+    setNuworksScoredJobs([]);
+    setScannerScoringProgress(null);
+    try {
+      const data = await readActivePageContext();
+      setPageContext(data);
+
+      chrome.runtime.sendMessage({ type: 'NUWORKS_DETECT_PAGE' }, (detectionResponse) => {
+        if (chrome.runtime.lastError || !detectionResponse?.success) {
+          return;
+        }
+
+        const detection = detectionResponse.data as NUworksDetectionResult;
+        setNuworksDetection(detection);
+
+        if (!detection.isNUworksPage || !detection.isJobListingPage) {
+          return;
+        }
+
+        chrome.runtime.sendMessage({ type: 'NUWORKS_EXTRACT_CURRENT_PAGE' }, (extractResponse) => {
+          if (chrome.runtime.lastError || !extractResponse?.success) {
+            return;
+          }
+
+          const extraction = extractResponse.data as NUworksPageExtractionResult;
+          setNuworksCurrentPageJobs(extraction);
+
+          if (extraction.jobs.length > 0) {
+            setToast({
+              type: 'success',
+              message: `NUworks scan: found ${extraction.jobs.length} jobs on this page.`,
+            });
+          } else if (extraction.diagnostics.strategyUsed === 'llm-fallback-pending') {
+            setToast({
+              type: 'error',
+              message: 'No structured listings found on this page yet. LLM fallback will be used in the next step.',
+            });
+          }
+        });
+      });
+    } catch (error) {
+      setErrorBanner(error instanceof Error ? error.message : "Couldn't read this page.");
+    } finally {
+      setIsReadingPage(false);
+    }
+  }, [readActivePageContext]);
+
+  const handleScannerDebugModeToggle = useCallback(async (enabled: boolean) => {
+    setScannerDebugMode(enabled);
+    await saveScannerDebugMode(enabled);
+  }, []);
+
+  const handleScanNUworksAllPages = useCallback(() => {
+    if (scannerActionBusy) {
+      setToast({ type: 'error', message: 'Scanner is busy. Please wait for current operation to finish.' });
+      return;
+    }
+
+    setErrorBanner(null);
+    setNuworksCurrentPageJobs(null);
+    setNuworksScoredJobs([]);
+    setScannerScoringProgress(null);
+    setNewJobsCount(0);
+    setProcessedSkipCount(0);
+    setNuworksScanProgress({ page: 0, jobsFound: 0, totalPages: null });
+    setIsScanningAllPages(true);
+    void clearScannerShortlist();
+
+    chrome.runtime.sendMessage({ type: 'NUWORKS_DETECT_PAGE' }, (detectionResponse) => {
+      if (chrome.runtime.lastError || !detectionResponse?.success) {
+        setIsScanningAllPages(false);
+        setToast({
+          type: 'error',
+          message: detectionResponse?.error ?? chrome.runtime.lastError?.message ?? 'Failed to detect page.',
+        });
+        return;
+      }
+
+      const detection = detectionResponse.data as NUworksDetectionResult;
+      setNuworksDetection(detection);
+
+      if (!detection.isNUworksPage) {
+        setIsScanningAllPages(false);
+        setToast({ type: 'error', message: 'Open a NUworks page before scanning.' });
+        return;
+      }
+
+      const nativePostedDateFilter: 'all' | '24h' | '7d' = scannerDateFilter === '24h' || scannerDateFilter === '7d'
+        ? scannerDateFilter
+        : 'all';
+
+      chrome.runtime.sendMessage({
+        type: 'NUWORKS_SCAN_ALL_PAGES',
+        payload: { nativePostedDateFilter },
+      }, async (scanResponse) => {
+        setIsScanningAllPages(false);
+
+        if (chrome.runtime.lastError || !scanResponse?.success) {
+          setToast({
+            type: 'error',
+            message: scanResponse?.error ?? chrome.runtime.lastError?.message ?? 'NUworks scan failed.',
+          });
+          return;
+        }
+
+        const extraction = scanResponse.data as NUworksPageExtractionResult;
+        const { allJobs, newCount } = markJobsByCache(extraction.jobs, scanCache);
+        void markJobsScanned(allJobs);
+
+        const { jobs: unprocessedJobs, skippedCount } = await filterOutFullyProcessedJobs(allJobs);
+        const visibleJobs = scanNewOnly ? unprocessedJobs.filter((job) => job.isNew) : unprocessedJobs;
+
+        setNuworksCurrentPageJobs({
+          ...extraction,
+          jobs: visibleJobs,
+        });
+        setNewJobsCount(newCount);
+        setProcessedSkipCount(skippedCount);
+
+        const nextCache = buildScanCache(extraction.llmFallbackInput.pageUrl, allJobs);
+        setScanCache(nextCache);
+        void saveScanCache(nextCache);
+
+        // Persist scanner state
+        const extractionForStorage: NUworksPageExtractionResult = {
+          ...extraction,
+          jobs: visibleJobs,
+        };
+        void saveScannerState(visibleJobs, [], extractionForStorage);
+
+        const summaryTop = allJobs.slice(0, 3).map((job) => `${job.company || 'Unknown'} - ${job.title || 'Untitled'}`);
+        const summaryMemory = createMemoryRecord({
+          snapshot: {
+            messages: [],
+            pageUrl: extraction.llmFallbackInput.pageUrl,
+            pageTitle: extraction.llmFallbackInput.pageTitle,
+          },
+          summary: `Scanned NUworks on ${new Date().toLocaleString()}: ${allJobs.length} jobs found, ${newCount} new jobs. Top: ${summaryTop.join('; ') || 'N/A'}`,
+          preferenceCandidates: [],
+        });
+
+        const nextMemories = applyMemoryLimits([summaryMemory, ...memoryStore.memories], memorySettings);
+        const nextMemoryStore: MemoryStore = {
+          ...memoryStore,
+          memories: nextMemories,
+        };
+        void saveMemoryStore(nextMemoryStore);
+        setMemoryStore(nextMemoryStore);
+
+        if (visibleJobs.length > 0) {
+          const pagesScanned = extraction.diagnostics.pagesScanned ?? nuworksScanProgress?.page ?? 1;
+          const skippedText = skippedCount > 0 ? `, ${skippedCount} skipped as already processed` : '';
+          setToast({
+            type: 'success',
+            message: `NUworks scan complete: ${visibleJobs.length} jobs across ${pagesScanned} pages (${newCount} new${skippedText}).`,
+          });
+        } else {
+          if (skippedCount > 0) {
+            setToast({
+              type: 'success',
+              message: `All scanned jobs were already processed. Skipped ${skippedCount} jobs.`,
+            });
+            return;
+          }
+
+          setToast({
+            type: 'error',
+            message: scanNewOnly
+              ? 'No new jobs found since last scan. Disable Scan New Only to view all results.'
+              : 'Scan completed but no jobs were extracted. Try enabling Debug mode in Settings.',
+          });
+        }
+      });
+    });
+  }, [nuworksScanProgress?.page, scanCache, scanNewOnly, memoryStore, memorySettings, scannerActionBusy, scannerDateFilter]);
 
   const runUtilityPrompt = useCallback(
     async (prompt: string): Promise<string> => {
@@ -347,6 +1093,549 @@ export default function App() {
     },
     [providerSettings]
   );
+
+  const runEmailGenerationFromSeed = useCallback(async (
+    seed: EmailGenerationSeed,
+    options?: {
+      emailType?: OutreachEmailType;
+      additionalInstructions?: string;
+      fallbackDraft?: EmailDraft;
+    }
+  ) => {
+    setIsEmailBusy(true);
+    try {
+      const generated = await generateSmartEmailDraft({
+        ...seed,
+        emailType: options?.emailType,
+        additionalInstructions: options?.additionalInstructions,
+        runPrompt: runUtilityPrompt,
+      });
+      setEmailDraft(generated.draft);
+      setSelectedEmailType(generated.emailType);
+      setEmailTypeConfidence(generated.detectionConfidence);
+      setIsEmailComposeOpen(true);
+      return generated;
+    } catch (error) {
+      if (options?.fallbackDraft) {
+        setEmailDraft(options.fallbackDraft);
+        setIsEmailComposeOpen(true);
+      }
+      throw error;
+    } finally {
+      setIsEmailBusy(false);
+    }
+  }, [runUtilityPrompt]);
+
+  const handleRegenerateEmailDraft = useCallback(async (instruction?: string) => {
+    if (!emailGenerationSeed) {
+      setToast({ type: 'error', message: 'No email context available to regenerate. Generate a draft first.' });
+      return;
+    }
+
+    try {
+      await runEmailGenerationFromSeed(emailGenerationSeed, {
+        emailType: selectedEmailType,
+        additionalInstructions: instruction || 'Generate a different angle from the previous draft while preserving factual accuracy.',
+      });
+      setToast({ type: 'success', message: 'Email regenerated.' });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to regenerate email.';
+      setToast({ type: 'error', message });
+    }
+  }, [emailGenerationSeed, selectedEmailType, runEmailGenerationFromSeed]);
+
+  const handleEmailTypeChange = useCallback((nextType: OutreachEmailType) => {
+    setSelectedEmailType(nextType);
+    if (!emailGenerationSeed) return;
+
+    void runEmailGenerationFromSeed(emailGenerationSeed, {
+      emailType: nextType,
+      additionalInstructions: 'Regenerate strictly using the selected email type structure and constraints.',
+    }).catch((error) => {
+      const message = error instanceof Error ? error.message : 'Failed to regenerate for selected email type.';
+      setToast({ type: 'error', message });
+    });
+  }, [emailGenerationSeed, runEmailGenerationFromSeed]);
+
+  const handleMakeEmailShorter = useCallback(() => {
+    void handleRegenerateEmailDraft('Keep the same message but make it shorter and more skimmable while preserving one clear CTA.');
+  }, [handleRegenerateEmailDraft]);
+
+  const handleMakeEmailLonger = useCallback(() => {
+    void handleRegenerateEmailDraft('Keep the same intent but make it slightly longer with one extra concrete proof point and one specific personalization signal.');
+  }, [handleRegenerateEmailDraft]);
+
+  const handleMakeEmailMoreFormal = useCallback(() => {
+    void handleRegenerateEmailDraft('Use a more formal and polished professional tone while staying concise and avoiding generic language.');
+  }, [handleRegenerateEmailDraft]);
+
+  const handleMakeEmailMoreCasual = useCallback(() => {
+    void handleRegenerateEmailDraft('Use a more casual and conversational tone while keeping it professional and concise.');
+  }, [handleRegenerateEmailDraft]);
+
+  const handleScoreCurrentPageJobs = useCallback(async () => {
+    console.log('[Scoring] Checking prerequisites...');
+    if (scannerActionBusy) {
+      setToast({ type: 'error', message: 'Scanner is busy. Please wait before scoring.' });
+      return;
+    }
+
+    if (!nuworksCurrentPageJobs) {
+      console.warn('[Scoring] nuworksCurrentPageJobs is null!');
+      setToast({ type: 'error', message: 'No scanned jobs found. Scan a page first.' });
+      return;
+    }
+
+    const jobs = getDateFilteredJobs(nuworksCurrentPageJobs?.jobs ?? []);
+    console.log(`[Scoring] After date filter: ${jobs.length} jobs (from ${nuworksCurrentPageJobs.jobs.length})`);
+    if (jobs.length === 0) {
+      setToast({
+        type: 'error',
+        message: scannerDateFilter === 'all'
+          ? 'Scan a NUworks listing page first.'
+          : 'No jobs match the selected date filter. Try All Dates or scan fresh results.',
+      });
+      return;
+    }
+
+    const { selectedProvider, apiKeys } = providerSettings;
+    if (!apiKeys[selectedProvider]) {
+      setView('settings');
+      setToast({ type: 'error', message: 'Add an API key before scoring jobs.' });
+      return;
+    }
+
+    setIsScoringJobs(true);
+    setNuworksScoredJobs([]);
+    setScannerScoringProgress({
+      scored: 0,
+      total: jobs.length,
+      batchIndex: 0,
+      totalBatches: Math.ceil(jobs.length / 10),
+    });
+
+    try {
+      console.log(`[Scoring] Starting to score ${jobs.length} jobs`);
+      const scored = await scoreJobsInBatches({
+        jobs,
+        candidateProfileText: JSON.stringify(MY_PROFILE, null, 2),
+        runPrompt: runUtilityPrompt,
+        onPartialResults: (partialScored) => setNuworksScoredJobs(partialScored),
+        onProgress: (progress) => setScannerScoringProgress(progress),
+      });
+
+      console.log(`[Scoring] Returned ${scored.length} scored jobs`);
+      scored.slice(0, 3).forEach((job, i) => {
+        console.log(`  Job ${i}: ${job.company} - ${job.title}, score=${job.matchScore}, visa=${job.visaFlag}`);
+      });
+
+      const { jobs: applyList, mode: profileFitMode } = selectProfileFitJobs(scored);
+      console.log(`[Scoring] Profile-fit filtering returned ${applyList.length} jobs with mode=${profileFitMode}`);
+      setNuworksScoredJobs(scored);
+
+      const scanUrl = nuworksCurrentPageJobs?.llmFallbackInput.pageUrl ?? pageContext?.url ?? window.location.href;
+      await saveScannerShortlist({
+        createdAt: new Date().toISOString(),
+        sourceUrl: scanUrl,
+        jobs: applyList,
+      });
+      await markJobsShortlisted(applyList);
+
+      // Persist scored jobs state
+      void saveScannerState(
+        nuworksCurrentPageJobs?.jobs ?? [],
+        scored,
+        nuworksCurrentPageJobs ?? null
+      );
+
+      const topPreview = applyList.slice(0, 5).map((job) => `${job.company || 'Unknown'} - ${job.title || 'Untitled'}`);
+      const shortlistMemory = createMemoryRecord({
+        snapshot: {
+          messages: [],
+          pageUrl: scanUrl,
+          pageTitle: nuworksCurrentPageJobs?.llmFallbackInput.pageTitle || 'NUworks Apply List',
+        },
+        summary: `Created apply-only shortlist: ${applyList.length} jobs kept after ranking. Preview: ${topPreview.join('; ') || 'N/A'}`,
+        preferenceCandidates: [],
+      });
+      const nextMemories = applyMemoryLimits([shortlistMemory, ...memoryStore.memories], memorySettings);
+      const nextMemoryStore: MemoryStore = {
+        ...memoryStore,
+        memories: nextMemories,
+      };
+      void saveMemoryStore(nextMemoryStore);
+      setMemoryStore(nextMemoryStore);
+
+      const modeText = profileFitMode === 'strict'
+        ? 'strict profile-fit criteria'
+        : profileFitMode === 'relaxed'
+          ? 'relaxed fallback criteria (score >= 5, non-red visa)'
+          : 'non-red fallback criteria';
+
+      const scoreBreakdown = {
+        total: scored.length,
+        scoreGte7: scored.filter(j => j.matchScore >= 7).length,
+        visaNotRed: scored.filter(j => j.visaFlag !== 'red').length,
+        paid: scored.filter(j => isPaidJob(j)).length,
+        profileFit: applyList.length,
+      };
+      
+      console.log('[Scoring] Final breakdown:', scoreBreakdown);
+
+      setToast({
+        type: 'success',
+        message: `Scored ${scored.length} jobs. Kept ${applyList.length} jobs using ${modeText}. (Score≥7: ${scoreBreakdown.scoreGte7}, Visa OK: ${scoreBreakdown.visaNotRed}, Paid: ${scoreBreakdown.paid})`,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to score jobs.';
+      setToast({ type: 'error', message });
+    } finally {
+      setIsScoringJobs(false);
+    }
+  }, [
+    nuworksCurrentPageJobs,
+    providerSettings,
+    runUtilityPrompt,
+    scannerActionBusy,
+    getDateFilteredJobs,
+    scannerDateFilter,
+    pageContext?.url,
+    memoryStore,
+    memorySettings,
+  ]);
+
+  const handleEnrichTopJobs = useCallback(() => {
+    if (scannerActionBusy) {
+      setToast({ type: 'error', message: 'Scanner is busy. Please wait before enriching.' });
+      return;
+    }
+
+    const sourceJobs = nuworksScoredJobs.length > 0
+      ? getDateFilteredJobs(nuworksScoredJobs)
+      : getDateFilteredJobs(nuworksCurrentPageJobs?.jobs ?? []);
+
+    if (sourceJobs.length === 0) {
+      setToast({ type: 'error', message: 'Scan jobs first before enriching details.' });
+      return;
+    }
+
+    const total = sourceJobs.length;
+    setIsEnrichingJobs(true);
+    setNuworksEnrichProgress({ current: 0, total });
+
+    chrome.runtime.sendMessage(
+      {
+        type: 'NUWORKS_ENRICH_TOP_JOBS',
+        payload: {
+          jobs: sourceJobs,
+        },
+      },
+      (response) => {
+        setIsEnrichingJobs(false);
+
+        if (chrome.runtime.lastError || !response?.success || !response?.data?.jobs) {
+          setToast({
+            type: 'error',
+            message: response?.error ?? chrome.runtime.lastError?.message ?? 'Failed to enrich job details.',
+          });
+          return;
+        }
+
+        const enrichedJobs = response.data.jobs as NUworksPageExtractionResult['jobs'];
+
+        setNuworksCurrentPageJobs((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            jobs: enrichedJobs,
+            extractedAt: new Date().toISOString(),
+          };
+        });
+
+        setNuworksScoredJobs((prev) => {
+          if (prev.length === 0) return prev;
+
+          const byKey = new Map(enrichedJobs.map((job) => [getJobCacheKey(job), job]));
+          return prev.map((job) => {
+            const key = getJobCacheKey(job);
+            const enriched = byKey.get(key);
+            if (!enriched) return job;
+            return {
+              ...job,
+              description: enriched.description,
+              postingDate: enriched.postingDate,
+              deadline: enriched.deadline,
+              jobType: enriched.jobType,
+              rawText: enriched.rawText,
+            };
+          });
+        });
+
+        setToast({
+          type: 'success',
+          message: `Enrichment complete: ${response.data.enriched} of ${response.data.attempted} eligible jobs updated.`,
+        });
+      }
+    );
+  }, [nuworksCurrentPageJobs?.jobs, nuworksScoredJobs, scannerActionBusy, getDateFilteredJobs]);
+
+  const handleEnrichTest30Jobs = useCallback(() => {
+    if (scannerActionBusy) {
+      setToast({ type: 'error', message: 'Scanner is busy. Please wait before enriching.' });
+      return;
+    }
+
+    const sourceJobs = nuworksScoredJobs.length > 0
+      ? getDateFilteredJobs(nuworksScoredJobs)
+      : getDateFilteredJobs(nuworksCurrentPageJobs?.jobs ?? []);
+
+    if (sourceJobs.length === 0) {
+      setToast({ type: 'error', message: 'Scan jobs first before enriching details.' });
+      return;
+    }
+
+    // TEST: Take only first 30 jobs for comparison
+    const testJobs = sourceJobs.slice(0, 30);
+    const total = testJobs.length;
+    setIsEnrichingJobs(true);
+    setNuworksEnrichProgress({ current: 0, total });
+
+    chrome.runtime.sendMessage(
+      {
+        type: 'NUWORKS_ENRICH_TOP_JOBS',
+        payload: {
+          jobs: testJobs,
+        },
+      },
+      (response) => {
+        setIsEnrichingJobs(false);
+
+        if (chrome.runtime.lastError || !response?.success || !response?.data?.jobs) {
+          setToast({
+            type: 'error',
+            message: response?.error ?? chrome.runtime.lastError?.message ?? 'Failed to enrich job details.',
+          });
+          return;
+        }
+
+        const enrichedJobs = response.data.jobs as NUworksPageExtractionResult['jobs'];
+
+        setNuworksCurrentPageJobs((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            jobs: enrichedJobs,
+            extractedAt: new Date().toISOString(),
+          };
+        });
+
+        setNuworksScoredJobs((prev) => {
+          if (prev.length === 0) return prev;
+
+          const byKey = new Map(enrichedJobs.map((job) => [getJobCacheKey(job), job]));
+          return prev.map((job) => {
+            const key = getJobCacheKey(job);
+            const enriched = byKey.get(key);
+            if (!enriched) return job;
+            return {
+              ...job,
+              description: enriched.description,
+              postingDate: enriched.postingDate,
+              deadline: enriched.deadline,
+              jobType: enriched.jobType,
+              rawText: enriched.rawText,
+            };
+          });
+        });
+
+        setToast({
+          type: 'success',
+          message: `[TEST] Enrichment complete: ${response.data.enriched} of ${response.data.attempted} jobs enriched (first 30 only).`,
+        });
+      }
+    );
+  }, [nuworksCurrentPageJobs?.jobs, nuworksScoredJobs, scannerActionBusy, getDateFilteredJobs]);
+
+  const saveScannerJobToSheetInternal = useCallback(async (
+    job: RawJobListing | ScoredJob,
+    options: { showToast: boolean }
+  ): Promise<boolean> => {
+    if (!sheetsConfig.spreadsheetId) {
+      setView('settings');
+      if (options.showToast) {
+        setToast({ type: 'error', message: 'Set a Spreadsheet ID in Settings before saving scanner jobs.' });
+      }
+      return false;
+    }
+    if (!googleSettings.clientId.trim() || !googleAuthState.isConnected) {
+      setView('settings');
+      if (options.showToast) {
+        setToast({ type: 'error', message: 'Connect Google account before saving scanner jobs.' });
+      }
+      return false;
+    }
+
+    try {
+      const payload = toScannerJobData(job, sheetsConfig.resumeVersions[0] ?? 'default');
+      const result = await appendJobToSheet({
+        clientId: googleSettings.clientId,
+        clientSecret: googleSettings.clientSecret,
+        spreadsheetId: sheetsConfig.spreadsheetId,
+        jobData: payload,
+      });
+      if (options.showToast) {
+        setToast({
+          type: 'success',
+          message: 'Scanner job saved to Google Sheets.',
+          linkUrl: result.spreadsheetUrl,
+          linkLabel: 'Open Sheet',
+        });
+      }
+      return true;
+    } catch (error) {
+      if (options.showToast) {
+        const message = error instanceof Error ? error.message : 'Failed to save scanner job.';
+        setToast({ type: 'error', message });
+      }
+      return false;
+    }
+  }, [googleAuthState.isConnected, googleSettings.clientId, googleSettings.clientSecret, sheetsConfig.spreadsheetId, sheetsConfig.resumeVersions]);
+
+  const handleScannerSaveJobToSheet = useCallback(async (job: RawJobListing | ScoredJob) => {
+    if (scannerActionBusy) {
+      setToast({ type: 'error', message: 'Scanner is busy. Please wait before saving jobs.' });
+      return;
+    }
+
+    setIsSavingScannerJobs(true);
+    try {
+      await saveScannerJobToSheetInternal(job, { showToast: true });
+    } finally {
+      setIsSavingScannerJobs(false);
+    }
+  }, [saveScannerJobToSheetInternal, scannerActionBusy]);
+
+  const handleScannerSaveAllToSheet = useCallback(async () => {
+    if (scannerActionBusy) {
+      setToast({ type: 'error', message: 'Scanner is busy. Please wait before batch save.' });
+      return;
+    }
+
+    const sourceJobs = nuworksScoredJobs.length > 0
+      ? allScoredJobs
+      : getDateFilteredJobs(nuworksCurrentPageJobs?.jobs ?? []);
+    if (sourceJobs.length === 0) {
+      setToast({ type: 'error', message: 'No jobs available to save with current filters.' });
+      return;
+    }
+
+    setIsSavingScannerJobs(true);
+    let successCount = 0;
+    let failCount = 0;
+    try {
+      for (const job of sourceJobs) {
+        const ok = await saveScannerJobToSheetInternal(job, { showToast: false });
+        if (ok) {
+          successCount += 1;
+        } else {
+          failCount += 1;
+        }
+      }
+    } finally {
+      setIsSavingScannerJobs(false);
+    }
+
+    setToast({
+      type: successCount > 0 ? 'success' : 'error',
+      message: successCount > 0
+        ? `Saved ${successCount}/${sourceJobs.length} scanner jobs to Sheets${failCount > 0 ? ` (${failCount} failed)` : ''}.`
+        : 'Failed to save scanner jobs to Sheets.',
+    });
+  }, [nuworksScoredJobs, nuworksCurrentPageJobs?.jobs, saveScannerJobToSheetInternal, scannerActionBusy, getDateFilteredJobs, allScoredJobs]);
+
+  const handleScannerGenerateEmail = useCallback(async (job: RawJobListing | ScoredJob) => {
+    if (scannerActionBusy) {
+      setToast({ type: 'error', message: 'Scanner is busy. Please wait before generating email.' });
+      return;
+    }
+
+    if (!googleAuthState.isConnected || !googleSettings.clientId.trim()) {
+      setView('settings');
+      setToast({ type: 'error', message: 'Connect Google account first in Settings.' });
+      return;
+    }
+
+    try {
+      const seed: EmailGenerationSeed = {
+        userIntentText: `Write a cold email for the ${job.title || 'role'} at ${job.company || 'this company'}`,
+        source: 'scanner',
+        pageTitle: pageContext?.title,
+        pageUrl: job.detailUrl || pageContext?.url,
+        pageText: [job.description, job.rawText, pageContext?.textContent].filter(Boolean).join('\n\n'),
+        companyName: job.company,
+        roleTitle: job.title,
+        recipientCandidates: extractEmailCandidates([job.description, job.rawText, pageContext?.textContent].filter(Boolean).join('\n')),
+        chatContext: messages.slice(-6).map((m) => `${m.role}: ${m.content}`).join('\n'),
+        resumeVersion: sheetsConfig.resumeVersions[0] ?? 'default',
+      };
+      setEmailGenerationSeed(seed);
+
+      const generated = await runEmailGenerationFromSeed(seed, {
+        emailType: 'cold-recruiter',
+      });
+
+      setToast({
+        type: 'success',
+        message: `Generated ${generated.emailType.replace(/-/g, ' ')} email draft. Review and send.`,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to generate smart email draft.';
+      setToast({ type: 'error', message });
+    }
+  }, [googleAuthState.isConnected, googleSettings.clientId, scannerActionBusy, pageContext?.title, pageContext?.url, pageContext?.textContent, messages, sheetsConfig.resumeVersions, runEmailGenerationFromSeed]);
+
+  const handleScannerChatAboutJob = useCallback((job: RawJobListing | ScoredJob) => {
+    if (scannerActionBusy) {
+      setToast({ type: 'error', message: 'Scanner is busy. Please wait before switching context.' });
+      return;
+    }
+
+    const text = [
+      `Job: ${job.title}`,
+      `Company: ${job.company}`,
+      `Location: ${job.location}`,
+      `Job URL: ${job.detailUrl}`,
+      `Description: ${job.description || job.rawText}`,
+    ].join('\n');
+
+    setPageContext({
+      url: job.detailUrl || 'https://nuworks.northeastern.edu',
+      title: `${job.title || 'Job'} @ ${job.company || 'Unknown Company'}`,
+      metaDescription: `NUworks scanner job context for ${job.title || 'job'}`,
+      textContent: text.slice(0, 15000),
+      extractedAt: new Date().toISOString(),
+    });
+    setView('chat');
+    setToast({ type: 'success', message: 'Loaded job context in Chat. Ask follow-up questions now.' });
+  }, [scannerActionBusy]);
+
+  const handleScannerExportCsv = useCallback(() => {
+    if (scannerActionBusy) {
+      setToast({ type: 'error', message: 'Scanner is busy. Please wait before exporting.' });
+      return;
+    }
+
+    const sourceJobs: Array<RawJobListing | ScoredJob> = nuworksScoredJobs.length > 0
+      ? allScoredJobs
+      : getDateFilteredJobs(nuworksCurrentPageJobs?.jobs ?? []);
+    if (sourceJobs.length === 0) {
+      setToast({ type: 'error', message: 'No scanner results to export yet.' });
+      return;
+    }
+
+    exportScannerJobsCsv(sourceJobs);
+    setToast({ type: 'success', message: `Exported ${sourceJobs.length} scanner results as CSV.` });
+  }, [nuworksCurrentPageJobs?.jobs, nuworksScoredJobs, scannerActionBusy, getDateFilteredJobs, allScoredJobs]);
 
   const summarizeCurrentConversationToMemory = useCallback(async () => {
     if (!memorySettings.autoSummarize || messages.length < 2) return;
@@ -420,7 +1709,7 @@ export default function App() {
   }, [isLoading, isMemoryBusy, messages, memorySettings.autoSummarize, summarizeCurrentConversationToMemory]);
 
   const handleSend = useCallback(
-    (overrideText?: string) => {
+    (overrideText?: string, overridePageContext?: PageContext) => {
       const text = (overrideText ?? inputValue).trim();
       // isSendingRef is synchronous; isLoading is the React-rendered fallback
       if (!text || isSendingRef.current || isLoading) return;
@@ -453,7 +1742,8 @@ export default function App() {
         content: m.content,
       }));
 
-      const queryText = [text, pageContext?.title ?? '', pageContext?.url ?? ''].join(' ').trim();
+      const activePageContext = overridePageContext ?? pageContext;
+      const queryText = [text, activePageContext?.title ?? '', activePageContext?.url ?? ''].join(' ').trim();
       const relevantMemories = searchMemories(queryText, memoryStore.memories, 3);
       const promptMemoryContext = buildPromptMemoryContext(relevantMemories, memoryStore.preferences);
       setLoadedMemoryCount(relevantMemories.length);
@@ -472,7 +1762,7 @@ export default function App() {
           type: 'SEND_TO_LLM',
           payload: {
             messages: history,
-            pageContext,
+            pageContext: activePageContext,
             llmConfig: {
               provider: selectedProvider,
               apiKey,
@@ -500,10 +1790,53 @@ export default function App() {
     [handleSend]
   );
 
-  const handleAnalyzeJob = useCallback(() => {
-    if (!pageContext) return;
-    handleSend('Analyze this job description and match it to my profile. Also tell me if I should reach out to a recruiter and whether I must tailor my resume before applying.');
-  }, [handleSend, pageContext]);
+  const handleAnalyzeJob = useCallback(async () => {
+    const basePrompt = 'Analyze this job description and match it to my profile. Also tell me if I should reach out to a recruiter and whether I must tailor my resume before applying.';
+
+    const buildPromptWithCanonicalScore = (context: PageContext): string => {
+      const pageUrl = normalizeUrlForLookup(context.url ?? '');
+      const pageTitle = normalizeScannerLookupPart(context.title ?? '');
+
+      const matchedByUrl = pageUrl
+        ? nuworksScoredJobs.find((job) => normalizeUrlForLookup(job.detailUrl ?? '') === pageUrl)
+        : undefined;
+
+      const matchedByTitleCompany = pageTitle
+        ? nuworksScoredJobs.find((job) => {
+            const title = normalizeScannerLookupPart(job.title ?? '');
+            const company = normalizeScannerLookupPart(job.company ?? '');
+            if (!title || !company) return false;
+            return pageTitle.includes(title) || pageTitle.includes(company);
+          })
+        : undefined;
+
+      const matched = matchedByUrl ?? matchedByTitleCompany;
+      if (!matched) {
+        return `${basePrompt}\n\nIf you provide a numeric ATS/match score, use the SAME scoring standard as JobBuddy Scanner Score and Rank Jobs.`;
+      }
+
+      return `${basePrompt}\n\nUse this canonical scanner score (same standard as Score and Rank Jobs) as authoritative for this job:\n- Match Score: ${matched.matchScore}/10\n- Visa Flag: ${matched.visaFlag}\n- Match Reason: ${matched.matchReason || 'N/A'}\n\nIMPORTANT: Keep this exact score in your analysis. Do not output a different ATS/match score for this same job.`;
+    };
+
+    if (pageContext) {
+      handleSend(buildPromptWithCanonicalScore(pageContext), pageContext);
+      return;
+    }
+
+    try {
+      setIsReadingPage(true);
+      setErrorBanner(null);
+      const data = await readActivePageContext();
+      setPageContext(data);
+      handleSend(buildPromptWithCanonicalScore(data), data);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Read the page first before analyzing.';
+      setErrorBanner(message);
+      setToast({ type: 'error', message });
+    } finally {
+      setIsReadingPage(false);
+    }
+  }, [handleSend, pageContext, readActivePageContext, nuworksScoredJobs]);
 
   // ── settings handlers ──
 
@@ -517,7 +1850,19 @@ export default function App() {
       selectedModels: { ...providerSettings.selectedModels, [provider]: model },
     };
     setProviderSettings(next);
+    setCustomModelInputs((prev) => ({ ...prev, [provider]: model }));
     await saveSettings(next);
+  };
+
+  const handleCustomModelChange = (provider: LLMProvider, value: string) => {
+    setCustomModelInputs((prev) => ({ ...prev, [provider]: value }));
+  };
+
+  const handleSaveCustomModel = async (provider: LLMProvider) => {
+    const model = customModelInputs[provider].trim();
+    if (!model) return;
+    await handleModelChange(provider, model);
+    setToast({ type: 'success', message: `${PROVIDER_META[provider].label} model set to ${model}.` });
   };
 
   const handleSaveKey = async (provider: LLMProvider) => {
@@ -789,7 +2134,7 @@ export default function App() {
     }
   };
 
-  const buildEmailDraftFromMessage = (messageId: string): EmailDraft | null => {
+  const buildEmailDraftFromMessage = (messageId: string): { draft: EmailDraft; userIntent?: string } | null => {
     const idx = messages.findIndex((msg) => msg.id === messageId);
     if (idx === -1) return null;
 
@@ -807,7 +2152,7 @@ export default function App() {
       resumeVersion: sheetsConfig.resumeVersions[0],
     });
 
-    return detected.draft;
+    return { draft: detected.draft, userIntent: previousUser };
   };
 
   const handleOpenEmailCompose = (messageId: string) => {
@@ -817,77 +2162,74 @@ export default function App() {
       return;
     }
 
-    const draft = buildEmailDraftFromMessage(messageId);
-    if (!draft) {
+    const draftContext = buildEmailDraftFromMessage(messageId);
+    if (!draftContext) {
       setToast({ type: 'error', message: 'Unable to parse email draft from this message.' });
       return;
     }
 
-    setEmailDraft(draft);
-    setIsEmailComposeOpen(true);
+    void (async () => {
+      try {
+        const seed: EmailGenerationSeed = {
+          userIntentText: draftContext.userIntent || 'write a cold email',
+          source: 'chat',
+          pageTitle: pageContext?.title,
+          pageUrl: pageContext?.url,
+          pageText: pageContext?.textContent,
+          recipientCandidates: [
+            draftContext.draft.to,
+            ...extractEmailCandidates(pageContext?.textContent),
+          ].filter(Boolean),
+          chatContext: messages.slice(-10).map((m) => `${m.role}: ${m.content}`).join('\n'),
+          resumeVersion: sheetsConfig.resumeVersions[0],
+        };
+        setEmailGenerationSeed(seed);
+
+        const generated = await runEmailGenerationFromSeed(seed);
+
+        setEmailDraft({
+          ...generated.draft,
+          to: generated.draft.to || draftContext.draft.to,
+        });
+      } catch {
+        // Fall back to parsed draft from assistant response if regeneration fails.
+        setEmailDraft(draftContext.draft);
+        setIsEmailComposeOpen(true);
+      }
+    })();
   };
 
   const handleComposeEmailManually = () => {
-    // Extract recruiter info from page and auto-fill email
     if (!pageContext?.textContent) {
-      // No page context, open with empty draft
-      const emptyDraft: EmailDraft = {
-        to: '',
-        subject: '',
-        body: '',
-        attachResume: false,
-        isHtml: false,
-      };
-      setEmailDraft(emptyDraft);
-      setIsEmailComposeOpen(true);
+      setToast({
+        type: 'error',
+        message: 'What company/role is this for? Read the page first so I can personalize the email.',
+      });
       return;
     }
 
-    setIsEmailBusy(true);
     setErrorBanner(null);
 
     (async () => {
       try {
-        // Use LLM to extract recruiter info
-        const recruiterPrompt = buildRecruiterExtractionPrompt(pageContext.textContent);
-        const recruiterResponse = await runUtilityPrompt(recruiterPrompt);
-        const recruiterInfo = parseRecruiterInfo(recruiterResponse);
-
-        // Build email with recruiter details
-        const emailBody = buildColdEmailBody({
-          recruiterName: recruiterInfo.recruiterName,
-          companyName: recruiterInfo.companyName,
-          jobTitle: recruiterInfo.jobTitle,
-        });
-
-        const subject = `Application for ${recruiterInfo.jobTitle} at ${recruiterInfo.companyName}`;
-
-        const draft: EmailDraft = {
-          to: recruiterInfo.recruiterEmail || '',
-          subject,
-          body: emailBody,
-          attachResume: true,
-          isHtml: false,
+        const seed: EmailGenerationSeed = {
+          userIntentText: 'write a cold email for this job',
+          source: 'manual',
+          pageTitle: pageContext.title,
+          pageUrl: pageContext.url,
+          pageText: pageContext.textContent,
+          recipientCandidates: extractEmailCandidates(pageContext.textContent),
+          chatContext: messages.slice(-8).map((m) => `${m.role}: ${m.content}`).join('\n'),
+          resumeVersion: sheetsConfig.resumeVersions[0],
         };
+        setEmailGenerationSeed(seed);
 
-        setEmailDraft(draft);
-        setIsEmailComposeOpen(true);
+        await runEmailGenerationFromSeed(seed);
 
-        if (recruiterInfo.recruiterEmail) {
-          setToast({
-            type: 'success',
-            message: `Found recruiter: ${recruiterInfo.recruiterName}. Review and send!`,
-          });
-        } else {
-          setToast({
-            type: 'error',
-            message: 'Could not find recruiter email on this page. Please enter it manually.',
-          });
-        }
+        setToast({ type: 'success', message: 'Generated personalized email draft. Review and send.' });
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Failed to extract recruiter info.';
         setErrorBanner(message);
-        // Still open with empty draft as fallback
         const emptyDraft: EmailDraft = {
           to: '',
           subject: '',
@@ -897,8 +2239,6 @@ export default function App() {
         };
         setEmailDraft(emptyDraft);
         setIsEmailComposeOpen(true);
-      } finally {
-        setIsEmailBusy(false);
       }
     })();
   };
@@ -922,6 +2262,7 @@ export default function App() {
       });
 
       if (updated) {
+        await refreshAppliedJobLookup();
         setToast({ type: 'success', message: 'Email sent and sheet row updated.' });
       }
     } catch {
@@ -931,16 +2272,20 @@ export default function App() {
 
   const handleSendEmail = async () => {
     if (!emailDraft) return;
+    if (!emailDraft.to.trim()) {
+      setToast({ type: 'error', message: 'Recipient email is required. Pick one from suggestions or type it in the To field.' });
+      return;
+    }
 
     setIsEmailBusy(true);
     try {
-      // Open Mail.app with pre-filled email
-      const subject = encodeURIComponent(emailDraft.subject || 'Job Application');
-      const body = encodeURIComponent(emailDraft.body || '');
-      const recipient = encodeURIComponent(emailDraft.to || '');
-
-      const mailtoLink = `mailto:${recipient}?subject=${subject}&body=${body}`;
-      window.open(mailtoLink);
+      await sendEmailViaGmail({
+        clientId: googleSettings.clientId,
+        clientSecret: googleSettings.clientSecret,
+        draft: emailDraft,
+        relatedJobUrl: pageContext?.url,
+        relatedCompany: jobDraft?.company,
+      });
 
       try {
         const nextActivityStore = recordOutreach(activityStore);
@@ -953,13 +2298,13 @@ export default function App() {
       setIsEmailComposeOpen(false);
       setToast({
         type: 'success',
-        message: 'Mail app opened. Add your resume, review, and send!',
+        message: `Email sent via Gmail to ${emailDraft.to}.`,
       });
 
       // Mark as emailed in sheet and update job tracking
       await maybeUpdateSheetAfterEmail();
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to open mail.';
+      const message = error instanceof Error ? error.message : 'Failed to send email via Gmail.';
       setToast({ type: 'error', message });
     } finally {
       setIsEmailBusy(false);
@@ -969,9 +2314,26 @@ export default function App() {
   const handleSaveEmailDraft = async () => {
     if (!emailDraft) return;
 
-    // Draft is already saved in local state; just close the modal
-    setIsEmailComposeOpen(false);
-    setToast({ type: 'success', message: 'Draft saved. You can edit it anytime.' });
+    if (!emailDraft.to.trim()) {
+      setToast({ type: 'error', message: 'Recipient email is required to save Gmail draft.' });
+      return;
+    }
+
+    setIsEmailBusy(true);
+    try {
+      await saveGmailDraft({
+        clientId: googleSettings.clientId,
+        clientSecret: googleSettings.clientSecret,
+        draft: emailDraft,
+      });
+      setIsEmailComposeOpen(false);
+      setToast({ type: 'success', message: `Draft saved to Gmail for ${emailDraft.to}.` });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to save Gmail draft.';
+      setToast({ type: 'error', message });
+    } finally {
+      setIsEmailBusy(false);
+    }
   };
 
   const handleUpdateMemorySettings = async (nextSettings: MemorySettings) => {
@@ -1100,6 +2462,7 @@ export default function App() {
     <div className="flex gap-1 rounded-xl bg-gray-100 p-1">
       {([
         { id: 'chat', label: 'Chat' },
+        { id: 'scanner', label: 'Scanner' },
         { id: 'memory', label: 'Memory' },
         { id: 'settings', label: 'Settings' },
       ] as const).map((tab) => (
@@ -1275,6 +2638,34 @@ export default function App() {
                       </option>
                     ))}
                   </select>
+
+                  <div className="mt-2 flex gap-2">
+                    <input
+                      type="text"
+                      value={customModelInputs[p]}
+                      onChange={(e) => handleCustomModelChange(p, e.target.value)}
+                      onKeyDown={(e) => e.key === 'Enter' && void handleSaveCustomModel(p)}
+                      placeholder={p === 'openrouter' ? 'Any OpenRouter model id (e.g. stepfun-ai/step3)' : 'Custom model id'}
+                      className="w-full text-xs border border-gray-200 rounded-lg px-3 py-2 outline-none focus:border-blue-400 focus:ring-1 focus:ring-blue-400 transition-all"
+                      autoComplete="off"
+                    />
+                    <button
+                      onClick={() => void handleSaveCustomModel(p)}
+                      disabled={!customModelInputs[p].trim()}
+                      className={`px-3 py-2 text-xs font-medium rounded-lg transition-all whitespace-nowrap ${
+                        customModelInputs[p].trim()
+                          ? 'bg-blue-600 text-white hover:bg-blue-700 shadow-sm'
+                          : 'bg-gray-100 text-gray-400 cursor-not-allowed'
+                      }`}
+                    >
+                      Use Custom
+                    </button>
+                  </div>
+                  {p === 'openrouter' && (
+                    <p className="mt-1 text-[11px] text-gray-500">
+                      OpenRouter supports many models. Paste any exact model ID from openrouter.ai/models.
+                    </p>
+                  )}
                 </div>
               </div>
             );
@@ -1500,6 +2891,25 @@ export default function App() {
             </div>
           </section>
 
+          <section className="mt-6 border-t border-gray-200 pt-5 space-y-3">
+            <div>
+              <h3 className="text-xs font-semibold text-gray-900">Scanner Settings</h3>
+              <p className="text-xs text-gray-500 mt-1">
+                Enable debug logs while refining NUworks selectors and page detection.
+              </p>
+            </div>
+
+            <label className="inline-flex items-center gap-2 text-xs text-gray-700">
+              <input
+                type="checkbox"
+                checked={scannerDebugMode}
+                onChange={(e) => void handleScannerDebugModeToggle(e.target.checked)}
+                className="h-3.5 w-3.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+              />
+              Debug mode (log NUworks DOM signals to console)
+            </label>
+          </section>
+
           {/* Footer note */}
           <p className="text-xs text-gray-400 mt-6 pb-2">
             Keys are stored in chrome.storage.local on your device only.
@@ -1569,6 +2979,78 @@ export default function App() {
           accept="application/json"
           className="hidden"
           onChange={(event) => void handleMemoryBackupFileChange(event)}
+        />
+
+        {toast && (
+          <div className="fixed top-3 right-3 z-50 max-w-[280px]">
+            <div
+              className={`rounded-lg border px-3 py-2 text-xs shadow-lg ${
+                toast.type === 'success'
+                  ? 'border-green-200 bg-green-50 text-green-800'
+                  : 'border-red-200 bg-red-50 text-red-800'
+              }`}
+            >
+              <p>{toast.message}</p>
+              {toast.linkUrl && (
+                <a
+                  href={toast.linkUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="mt-1 inline-block font-semibold underline"
+                >
+                  {toast.linkLabel ?? 'Open'}
+                </a>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  if (view === 'scanner') {
+    return (
+      <div className="flex flex-col h-full bg-white">
+        <header className="px-4 py-3 border-b border-gray-200 shadow-sm flex-shrink-0 space-y-2">
+          <div className="flex items-center gap-2">
+            <div className="w-7 h-7 rounded-lg bg-blue-600 flex items-center justify-center">
+              <span className="text-white text-sm font-bold">J</span>
+            </div>
+            <span className="text-sm font-semibold text-gray-900">JobBuddy AI</span>
+          </div>
+          {renderTopTabs()}
+        </header>
+
+        <ScannerTab
+          detection={nuworksDetection}
+          extraction={filteredCurrentPageJobs}
+          isScanning={isScanningAllPages}
+          scanProgress={nuworksScanProgress}
+          isEnriching={isEnrichingJobs}
+          enrichProgress={nuworksEnrichProgress}
+          isScoring={isScoringJobs}
+          scoringProgress={scannerScoringProgress}
+          scoredJobs={profileFitJobs}
+          allScoredJobs={allScoredJobs}
+          isBusy={scannerActionBusy}
+          scanNewOnly={scanNewOnly}
+          showProfileFitOnly={showProfileFitOnly}
+          dateFilter={scannerDateFilter}
+          newJobsCount={newJobsCount}
+          skippedProcessedCount={processedSkipCount}
+          lastScanDate={scanCache?.lastScanDate ?? null}
+          onToggleScanNewOnly={setScanNewOnly}
+          onToggleProfileFitOnly={setShowProfileFitOnly}
+          onDateFilterChange={setScannerDateFilter}
+          onScanCurrentPage={handleScanNUworksAllPages}
+          onEnrichTopJobs={handleEnrichTopJobs}
+          onEnrichTest30Jobs={handleEnrichTest30Jobs}
+          onScoreJobs={() => void handleScoreCurrentPageJobs()}
+          onSaveJobToSheet={(job) => void handleScannerSaveJobToSheet(job)}
+          onGenerateEmail={handleScannerGenerateEmail}
+          onChatAboutJob={handleScannerChatAboutJob}
+          onSaveAllToSheet={() => void handleScannerSaveAllToSheet()}
+          onExportCsv={handleScannerExportCsv}
         />
 
         {toast && (
@@ -1673,7 +3155,16 @@ export default function App() {
       {pageContext && (
         <PageContextBanner
           pageContext={pageContext}
-          onClear={() => setPageContext(null)}
+          nuworksDetection={nuworksDetection}
+          onClear={() => {
+            setPageContext(null);
+            setNuworksDetection(null);
+            setNuworksCurrentPageJobs(null);
+            setNuworksScanProgress(null);
+            setNuworksEnrichProgress(null);
+            setNuworksScoredJobs([]);
+            setScannerScoringProgress(null);
+          }}
         />
       )}
 
@@ -1689,7 +3180,6 @@ export default function App() {
         isLoading={isLoading}
         isReadingPage={isReadingPage}
         isExtractingJob={isExtractingJob}
-        hasPageContext={Boolean(pageContext)}
         canSaveToSheet={Boolean(pageContext) && googleAuthState.isConnected && Boolean(sheetsConfig.spreadsheetId)}
       />
 
@@ -1707,8 +3197,17 @@ export default function App() {
         isOpen={isEmailComposeOpen}
         draft={emailDraft}
         resumeVersions={sheetsConfig.resumeVersions}
+        emailType={selectedEmailType}
+        emailTypeConfidence={emailTypeConfidence}
+        recipientSuggestions={recipientSuggestions}
         isBusy={isEmailBusy}
         onClose={() => setIsEmailComposeOpen(false)}
+        onEmailTypeChange={handleEmailTypeChange}
+        onRegenerate={() => void handleRegenerateEmailDraft()}
+        onMakeShorter={handleMakeEmailShorter}
+        onMakeLonger={handleMakeEmailLonger}
+        onMoreFormal={handleMakeEmailMoreFormal}
+        onMoreCasual={handleMakeEmailMoreCasual}
         onChange={setEmailDraft}
         onSend={() => void handleSendEmail()}
         onSaveDraft={() => void handleSaveEmailDraft()}

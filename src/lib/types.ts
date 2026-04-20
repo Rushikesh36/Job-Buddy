@@ -1,4 +1,11 @@
 // Shared types for JobBuddy AI Chrome Extension
+import type {
+  NUworksDetectionResult,
+  NUworksEnrichJobsResult,
+  NUworksEnrichProgress,
+  NUworksPageExtractionResult,
+  NUworksScanProgress,
+} from '../types/scanner';
 
 export interface PageContext {
   url: string;
@@ -26,7 +33,7 @@ export type ClaudeMessage = LLMMessage;
 
 // ---- Multi-LLM types ----
 
-export type LLMProvider = 'claude' | 'gemini' | 'openai';
+export type LLMProvider = 'claude' | 'gemini' | 'openai' | 'openrouter';
 
 export interface LLMConfig {
   provider: LLMProvider;
@@ -88,11 +95,12 @@ export const DEFAULT_MODELS: Record<LLMProvider, string> = {
   claude: 'claude-sonnet-4-20250514',
   gemini: 'gemini-2.5-flash',
   openai: 'gpt-4o',
+  openrouter: 'meta-llama/llama-3.1-8b-instruct:free',
 };
 
 export const DEFAULT_PROVIDER_SETTINGS: ProviderSettings = {
   selectedProvider: 'claude',
-  apiKeys: { claude: '', gemini: '', openai: '' },
+  apiKeys: { claude: '', gemini: '', openai: '', openrouter: '' },
   selectedModels: { ...DEFAULT_MODELS },
 };
 
@@ -100,6 +108,12 @@ export const DEFAULT_PROVIDER_SETTINGS: ProviderSettings = {
 
 export type MessageType =
   | 'GET_PAGE_CONTENT'
+  | 'NUWORKS_DETECT_PAGE'
+  | 'NUWORKS_EXTRACT_CURRENT_PAGE'
+  | 'NUWORKS_SCAN_ALL_PAGES'
+  | 'NUWORKS_ENRICH_TOP_JOBS'
+  | 'SCAN_PROGRESS'
+  | 'ENRICH_PROGRESS'
   | 'PAGE_CONTENT_RESULT'
   | 'PAGE_CONTENT_ERROR'
   | 'SEND_TO_LLM'
@@ -115,6 +129,58 @@ export type MessageType =
 export interface ChromeMessage {
   type: MessageType;
   payload?: unknown;
+}
+
+export interface NUworksDetectPageResult {
+  success: boolean;
+  data?: NUworksDetectionResult;
+  error?: string;
+}
+
+export interface NUworksExtractCurrentPageResult {
+  success: boolean;
+  data?: NUworksPageExtractionResult;
+  error?: string;
+}
+
+export interface NUworksScanAllPagesResult {
+  success: boolean;
+  data?: NUworksPageExtractionResult;
+  error?: string;
+}
+
+export interface NUworksScanAllPagesPayload {
+  nativePostedDateFilter?: 'all' | '24h' | '7d';
+}
+
+export interface NUworksEnrichTopJobsPayload {
+  jobs: Array<{
+    title: string;
+    company: string;
+    location: string;
+    jobId: string;
+    postingDate: string;
+    deadline: string;
+    jobType: string;
+    description: string;
+    detailUrl: string;
+    rawText: string;
+  }>;
+  topN?: number;
+}
+
+export interface NUworksEnrichTopJobsResult {
+  success: boolean;
+  data?: NUworksEnrichJobsResult;
+  error?: string;
+}
+
+export interface ScanProgressPayload {
+  data: NUworksScanProgress;
+}
+
+export interface EnrichProgressPayload {
+  data: NUworksEnrichProgress;
 }
 
 export interface SendToLLMPayload {

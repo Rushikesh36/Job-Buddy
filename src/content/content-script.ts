@@ -1,4 +1,8 @@
 import type { PageContext } from '../lib/types';
+import { detectNUworksPlatform } from './page-detectors';
+import type { NUworksEnrichTopJobsPayload } from '../lib/types';
+import type { NUworksScanAllPagesPayload } from '../lib/types';
+import { extractNUworksJobsFromCurrentPage, scanNUworksAllPages, enrichNUworksTopJobs } from './nuworks-scanner';
 
 const MAX_TEXT_LENGTH = 15000;
 
@@ -32,5 +36,67 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       });
     }
     return true; // keep channel open for async sendResponse
+  }
+
+  if (message?.type === 'NUWORKS_DETECT_PAGE') {
+    void detectNUworksPlatform()
+      .then((result) => {
+        sendResponse({ success: true, data: result });
+      })
+      .catch((err) => {
+        sendResponse({
+          success: false,
+          error: err instanceof Error ? err.message : 'NUworks detection failed',
+        });
+      });
+
+    return true;
+  }
+
+  if (message?.type === 'NUWORKS_EXTRACT_CURRENT_PAGE') {
+    void extractNUworksJobsFromCurrentPage()
+      .then((result) => {
+        sendResponse({ success: true, data: result });
+      })
+      .catch((err) => {
+        sendResponse({
+          success: false,
+          error: err instanceof Error ? err.message : 'NUworks extraction failed',
+        });
+      });
+
+    return true;
+  }
+
+  if (message?.type === 'NUWORKS_SCAN_ALL_PAGES') {
+    const payload = (message?.payload ?? {}) as NUworksScanAllPagesPayload;
+    void scanNUworksAllPages(payload.nativePostedDateFilter)
+      .then((result) => {
+        sendResponse({ success: true, data: result });
+      })
+      .catch((err) => {
+        sendResponse({
+          success: false,
+          error: err instanceof Error ? err.message : 'NUworks all-pages scan failed',
+        });
+      });
+
+    return true;
+  }
+
+  if (message?.type === 'NUWORKS_ENRICH_TOP_JOBS') {
+    const payload = (message?.payload ?? {}) as NUworksEnrichTopJobsPayload;
+    void enrichNUworksTopJobs(payload.jobs ?? [], payload.topN)
+      .then((result) => {
+        sendResponse({ success: true, data: result });
+      })
+      .catch((err) => {
+        sendResponse({
+          success: false,
+          error: err instanceof Error ? err.message : 'NUworks job enrichment failed',
+        });
+      });
+
+    return true;
   }
 });

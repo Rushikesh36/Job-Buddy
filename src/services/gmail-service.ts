@@ -2,6 +2,7 @@ import type { EmailDetectionResult, EmailDraft, GmailSendResult, SentEmail } fro
 import { getValidGoogleAccessToken } from './google-auth';
 
 const SENT_EMAILS_KEY = 'sentEmails';
+const EMAIL_REGEX = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
 
 function toBase64Url(str: string): string {
   return btoa(unescape(encodeURIComponent(str)))
@@ -68,6 +69,38 @@ function normalizeSubject(text: string): string {
   return text.replace(/^subject\s*:\s*/i, '').trim();
 }
 
+function uniqueEmails(values: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const value of values) {
+    const normalized = value.trim().toLowerCase();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
+}
+
+function scoreEmailPreference(email: string): number {
+  const positive = /(recruit|talent|career|jobs|hiring|hr)/i;
+  const negative = /(no-?reply|donotreply|support|help|privacy|legal|webmaster)/i;
+  let score = 0;
+  if (positive.test(email)) score += 3;
+  if (negative.test(email)) score -= 4;
+  return score;
+}
+
+function pickPreferredEmail(emails: string[]): string {
+  if (emails.length === 0) return '';
+  return [...emails].sort((a, b) => scoreEmailPreference(b) - scoreEmailPreference(a))[0];
+}
+
+export function extractEmailCandidates(text?: string): string[] {
+  if (!text) return [];
+  const matches = text.match(EMAIL_REGEX) ?? [];
+  return uniqueEmails(matches);
+}
+
 function extractSubject(content: string): string {
   const line = content.match(/^\s*subject\s*:\s*(.+)$/im)?.[1]?.trim();
   if (line) return normalizeSubject(line);
@@ -84,11 +117,13 @@ function extractTo(content: string, pageText?: string): string {
   const line = content.match(/^\s*to\s*:\s*([^\n]+)$/im)?.[1]?.trim();
   if (line) return line;
 
-  const emailInBody = content.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0];
-  if (emailInBody) return emailInBody;
+  const bodyCandidates = extractEmailCandidates(content);
+  const preferredBody = pickPreferredEmail(bodyCandidates);
+  if (preferredBody) return preferredBody;
 
-  const emailInPage = pageText?.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0];
-  if (emailInPage) return emailInPage;
+  const pageCandidates = extractEmailCandidates(pageText);
+  const preferredPage = pickPreferredEmail(pageCandidates);
+  if (preferredPage) return preferredPage;
 
   return '';
 }

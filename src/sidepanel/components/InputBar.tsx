@@ -11,7 +11,6 @@ interface InputBarProps {
   isLoading: boolean;
   isReadingPage: boolean;
   isExtractingJob: boolean;
-  hasPageContext: boolean;
   canSaveToSheet: boolean;
 }
 
@@ -26,7 +25,6 @@ export default function InputBar({
   isLoading,
   isReadingPage,
   isExtractingJob,
-  hasPageContext,
   canSaveToSheet,
 }: InputBarProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -52,7 +50,7 @@ export default function InputBar({
   };
 
   const canSend = !isLoading && value.trim().length > 0;
-  const canAnalyzeJob = !isLoading && !isReadingPage && hasPageContext;
+  const canAnalyzeJob = !isLoading && !isReadingPage;
 
   return (
     <div className="border-t border-gray-200 bg-white px-3 pt-2 pb-3">
