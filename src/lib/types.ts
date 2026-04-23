@@ -27,12 +27,13 @@ export type ClaudeMessage = LLMMessage;
 
 // ---- Multi-LLM types ----
 
-export type LLMProvider = 'claude' | 'gemini' | 'openai' | 'openrouter' | 'groq';
+export type LLMProvider = 'claude' | 'gemini' | 'openai' | 'openrouter' | 'ollama';
 
 export interface LLMConfig {
   provider: LLMProvider;
   apiKey: string;
   model: string;
+  baseUrl?: string;
 }
 
 // Stored in chrome.storage.local
@@ -40,6 +41,7 @@ export interface ProviderSettings {
   selectedProvider: LLMProvider;
   apiKeys: Record<LLMProvider, string>;
   selectedModels: Record<LLMProvider, string>;
+  ollamaBaseUrl?: string;
 }
 
 export interface GoogleAuthState {
@@ -90,13 +92,14 @@ export const DEFAULT_MODELS: Record<LLMProvider, string> = {
   gemini: 'gemini-2.5-flash',
   openai: 'gpt-4o',
   openrouter: 'meta-llama/llama-3.1-8b-instruct:free',
-  groq: 'llama-3.3-70b-versatile',
+  ollama: 'qwen2.5:14b',
 };
 
 export const DEFAULT_PROVIDER_SETTINGS: ProviderSettings = {
-  selectedProvider: 'claude',
-  apiKeys: { claude: '', gemini: '', openai: '', openrouter: '', groq: '' },
+  selectedProvider: 'ollama',
+  apiKeys: { claude: '', gemini: '', openai: '', openrouter: '', ollama: '' },
   selectedModels: { ...DEFAULT_MODELS },
+  ollamaBaseUrl: 'http://127.0.0.1:11434',
 };
 
 // ---- Chrome message types ----
@@ -175,6 +178,6 @@ export interface FallbackSettings {
 
 export const DEFAULT_FALLBACK_SETTINGS: FallbackSettings = {
   enabled: true,
-  order: ['groq', 'gemini', 'openai', 'claude', 'openrouter'],
+  order: ['ollama', 'gemini', 'openai', 'claude', 'openrouter'],
   showProviderLabel: true,
 };

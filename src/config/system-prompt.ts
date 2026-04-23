@@ -1,11 +1,9 @@
 import { MY_PROFILE, type ProfileType } from '../lib/profile';
 import type { PageContext } from '../lib/types';
-import type { PromptMemoryContext } from '../types/memory';
 
 export function buildSystemPrompt(
   profile: ProfileType = MY_PROFILE,
-  pageContext: PageContext | null = null,
-  memoryContext: PromptMemoryContext | null = null
+  pageContext: PageContext | null = null
 ): string {
   return `You are JobBuddy AI, a personal job application assistant for ${profile.name}.
 
@@ -26,16 +24,6 @@ Page Content:
 ${pageContext.textContent}`
     : 'No page content extracted yet. Ask the user to click "Read Page" to capture the current page.'
 }
-
-## Relevant Context from Past Conversations
-${memoryContext?.relevantMemories?.length
-  ? memoryContext.relevantMemories.join('\n')
-  : '- No relevant past memories found for this request.'}
-
-## Learned Preferences
-${memoryContext?.learnedPreferences?.length
-  ? memoryContext.learnedPreferences.join('\n')
-  : '- No learned preferences available yet.'}
 
 ## Job Analysis Format
 Whenever the page contains a job posting OR the user asks you to analyze a job, ALWAYS respond using EXACTLY this format and nothing else unless the user asks a follow-up question:

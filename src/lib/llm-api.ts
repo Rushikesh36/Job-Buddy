@@ -40,6 +40,8 @@ export function isRateLimitErrorMessage(errorMsg: string): boolean {
     'tokens per minute',
     'overloaded',
     'capacity',
+    'ollama is not running',
+    'ollama error',
   ];
   return phrases.some((p) => lower.includes(p));
 }
@@ -87,20 +89,17 @@ export const PROVIDER_META: Record<LLMProvider, ProviderMeta> = {
     keyGuide: 'platform.openai.com/api-keys',
     hintUrl: 'https://platform.openai.com/api-keys',
   },
-  groq: {
-    label: 'Groq',
-    color: '#F55036',
+  ollama: {
+    label: 'Ollama',
+    color: '#000000',
     models: [
-      { id: 'llama-3.3-70b-versatile',  name: 'Llama 3.3 70B' },
-      { id: 'llama-3.1-8b-instant',     name: 'Llama 3.1 8B (Fast)' },
-      { id: 'mixtral-8x7b-32768',       name: 'Mixtral 8x7B' },
-      { id: 'gemma2-9b-it',             name: 'Gemma 2 9B' },
-      { id: 'qwen-qwq-32b',             name: 'Qwen QwQ 32B' },
+      { id: 'qwen2.5:14b',  name: 'Qwen 2.5 14B (Best Quality)' },
+      { id: 'gemma4:e4b', name: 'Gemma 4 E4B (Fast)' },
     ],
-    defaultModel: 'llama-3.3-70b-versatile',
-    keyPlaceholder: 'gsk_…',
-    keyGuide: 'console.groq.com',
-    hintUrl: 'https://console.groq.com/keys',
+    defaultModel: 'qwen2.5:14b',
+    keyPlaceholder: '',
+    keyGuide: '',
+    hintUrl: '',
   },
   openrouter: {
     label: 'OpenRouter',
@@ -168,6 +167,94 @@ async function readSSE(
     }
   } finally {
     reader.releaseLock();
+  }
+}
+
+async function readOpenAICompatibleStream(
+  response: Response,
+  onChunk: (text: string) => void,
+  callbacks: StreamCallbacks
+): Promise<void> {
+  if (!response.body) {
+    callbacks.onError('No response body received from API.');
+    return;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let sawDone = false;
+
+  try {
+    while (!sawDone) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+
+        if (trimmed.startsWith('data: ')) {
+          const data = trimmed.slice(6);
+          if (data === '[DONE]') {
+            sawDone = true;
+            break;
+          }
+
+          try {
+            const parsed = JSON.parse(data) as {
+              choices?: { delta?: { content?: string }; message?: { content?: string } }[];
+            };
+            const text = parsed.choices?.[0]?.delta?.content ?? parsed.choices?.[0]?.message?.content;
+            if (text) {
+              onChunk(text);
+            }
+          } catch {
+            // skip unparseable lines
+          }
+          continue;
+        }
+
+        if (trimmed.startsWith('{')) {
+          try {
+            const parsed = JSON.parse(trimmed) as {
+              choices?: { delta?: { content?: string }; message?: { content?: string } }[];
+              message?: { content?: string };
+            };
+            const text = parsed.choices?.[0]?.delta?.content ?? parsed.choices?.[0]?.message?.content ?? parsed.message?.content;
+            if (text) {
+              onChunk(text);
+            }
+          } catch {
+            // skip unparseable lines
+          }
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const tail = buffer.trim();
+  if (tail) {
+    try {
+      const parsed = JSON.parse(tail) as {
+        choices?: { delta?: { content?: string }; message?: { content?: string } }[];
+        message?: { content?: string };
+      };
+      const text = parsed.choices?.[0]?.delta?.content ?? parsed.choices?.[0]?.message?.content ?? parsed.message?.content;
+      if (text) {
+        onChunk(text);
+        return;
+      }
+    } catch {
+      onChunk(tail);
+      return;
+    }
   }
 }
 
@@ -316,10 +403,7 @@ async function streamOpenAI(
     ...messages.map((m) => ({ role: m.role, content: m.content })),
   ];
 
-  const isGroq = config.provider === 'groq';
-  const baseUrl = isGroq
-    ? 'https://api.groq.com/openai/v1/chat/completions'
-    : 'https://api.openai.com/v1/chat/completions';
+  const baseUrl = 'https://api.openai.com/v1/chat/completions';
 
   const response = await fetch(baseUrl, {
     method: 'POST',
@@ -337,8 +421,7 @@ async function streamOpenAI(
 
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
-    const providerName = isGroq ? 'Groq' : 'OpenAI';
-    callbacks.onError(handleHttpError(response.status, body, providerName));
+    callbacks.onError(handleHttpError(response.status, body, 'OpenAI'));
     return;
   }
 
@@ -354,6 +437,84 @@ async function streamOpenAI(
       } catch {
         // skip
       }
+    },
+    callbacks
+  );
+
+  callbacks.onDone();
+}
+
+// ─── Ollama ──────────────────────────────────────────────────────────────────
+
+async function streamOllama(
+  messages: LLMMessage[],
+  systemPrompt: string,
+  config: LLMConfig,
+  callbacks: StreamCallbacks
+): Promise<void> {
+  const openAIMessages = [
+    { role: 'system', content: systemPrompt },
+    ...messages.map((m) => ({ role: m.role, content: m.content })),
+  ];
+
+  const baseUrl = config.baseUrl || 'http://127.0.0.1:11434';
+  const url = `${baseUrl.replace(/\/$/, '')}/v1/chat/completions`;
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'text/event-stream',
+      },
+      body: JSON.stringify({
+        model: config.model,
+        stream: true,
+        temperature: 0.7,
+        messages: openAIMessages,
+      }),
+    });
+  } catch (err) {
+    callbacks.onError('Ollama is not running. Start it by opening the Ollama app, or run `ollama serve` in Terminal.');
+    return;
+  }
+
+  if (!response.ok) {
+    if (response.status === 0 || !response.status) {
+      callbacks.onError('Ollama is not running. Start it by opening the Ollama app.');
+      return;
+    }
+    const contentType = response.headers.get('content-type') ?? '';
+    let errorDetail = '';
+
+    if (contentType.includes('application/json')) {
+      const body = (await response.json().catch(() => null)) as { error?: { message?: string }; message?: string } | null;
+      errorDetail = body?.error?.message ?? body?.message ?? '';
+    } else {
+      errorDetail = await response.text().catch(() => '');
+    }
+
+    const fallbackDetail = errorDetail.trim() || response.statusText || `HTTP ${response.status}`;
+    if (response.status === 403) {
+      callbacks.onError(
+        `Ollama returned 403 Forbidden. This usually means the request is being blocked by the local Ollama endpoint or a proxy/CORS issue, not that the model is missing. ` +
+        `Try switching the base URL to http://127.0.0.1:11434, then click Test Connection again.`
+      );
+      return;
+    }
+
+    callbacks.onError(
+      `Ollama request failed (${response.status}). ${fallbackDetail}. ` +
+      `Check that Ollama is running and that model "${config.model}" exists locally.`
+    );
+    return;
+  }
+
+  await readOpenAICompatibleStream(
+    response,
+    (text) => {
+      if (text) callbacks.onChunk(text);
     },
     callbacks
   );
@@ -432,8 +593,10 @@ export async function streamLLMResponse(
         await streamGemini(messages, systemPrompt, config, callbacks);
         break;
       case 'openai':
-      case 'groq':
         await streamOpenAI(messages, systemPrompt, config, callbacks);
+        break;
+      case 'ollama':
+        await streamOllama(messages, systemPrompt, config, callbacks);
         break;
       case 'openrouter':
         await streamOpenRouter(messages, systemPrompt, config, callbacks);

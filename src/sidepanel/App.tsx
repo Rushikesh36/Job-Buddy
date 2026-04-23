@@ -59,6 +59,7 @@ import {
 } from '../services/memory-service';
 import type { MemorySettings, MemoryStore, PromptMemoryContext } from '../types/memory';
 import { DEFAULT_MEMORY_SETTINGS, DEFAULT_MEMORY_STORE } from '../types/memory';
+import { checkOllamaConnection, getOllamaModels, type OllamaStatus } from '../services/ollama-connection';
 import ChatWindow from './components/ChatWindow';
 import InputBar from './components/InputBar';
 import PageContextBanner from './components/PageContextBanner';
@@ -67,7 +68,7 @@ import JobSaveModal from './components/JobSaveModal';
 import EmailComposeModal from './components/EmailComposeModal';
 import MemoryPanel from './components/MemoryPanel';
 
-const PROVIDERS: LLMProvider[] = ['claude', 'gemini', 'openai', 'groq', 'openrouter'];
+const PROVIDERS: LLMProvider[] = ['claude', 'gemini', 'openai', 'ollama', 'openrouter'];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -79,11 +80,16 @@ function loadSettings(): Promise<ProviderSettings> {
   return new Promise((resolve) => {
     chrome.storage.local.get(['providerSettings'], (result) => {
       const raw = (result.providerSettings as Partial<ProviderSettings>) ?? DEFAULT_PROVIDER_SETTINGS;
+      const normalizedOllamaBaseUrl =
+        raw.ollamaBaseUrl === 'http://localhost:11434'
+          ? 'http://127.0.0.1:11434'
+          : raw.ollamaBaseUrl;
       const selectedProvider = PROVIDERS.includes(raw.selectedProvider as LLMProvider)
         ? (raw.selectedProvider as LLMProvider)
         : DEFAULT_PROVIDER_SETTINGS.selectedProvider;
 
-      resolve({
+      const nextSettings = {
+        ...DEFAULT_PROVIDER_SETTINGS,
         selectedProvider,
         apiKeys: {
           ...DEFAULT_PROVIDER_SETTINGS.apiKeys,
@@ -93,7 +99,14 @@ function loadSettings(): Promise<ProviderSettings> {
           ...DEFAULT_PROVIDER_SETTINGS.selectedModels,
           ...(raw.selectedModels ?? {}),
         },
-      });
+        ollamaBaseUrl: normalizedOllamaBaseUrl ?? DEFAULT_PROVIDER_SETTINGS.ollamaBaseUrl,
+      };
+
+      if (raw.ollamaBaseUrl === 'http://localhost:11434') {
+        chrome.storage.local.set({ providerSettings: nextSettings });
+      }
+
+      resolve(nextSettings);
     });
   });
 }
@@ -152,7 +165,7 @@ export default function App() {
     gemini: '',
     openai: '',
     openrouter: '',
-    groq: '',
+    ollama: '',
   });
   const [keyVisible, setKeyVisible] = useState<LLMProvider | null>(null);
   const [customModelInputs, setCustomModelInputs] = useState<Record<LLMProvider, string>>({
@@ -160,7 +173,7 @@ export default function App() {
     gemini: '',
     openai: '',
     openrouter: '',
-    groq: '',
+    ollama: '',
   });
   const [googleSettings, setGoogleSettingsState] = useState<GoogleSettings>(DEFAULT_GOOGLE_SETTINGS);
   const [googleClientIdInput, setGoogleClientIdInput] = useState('');
@@ -198,6 +211,39 @@ export default function App() {
   const [activityStore, setActivityStore] = useState<ActivityStore>({ days: [] });
   const [fallbackSettings, setFallbackSettings] = useState<FallbackSettings>(DEFAULT_FALLBACK_SETTINGS);
   const memoryBackupInputRef = useRef<HTMLInputElement>(null);
+
+  const [ollamaStatus, setOllamaStatus] = useState<OllamaStatus | null>(null);
+  const [ollamaBaseUrlInput, setOllamaBaseUrlInput] = useState('http://127.0.0.1:11434');
+
+  const showToast = useCallback((type: ToastType, message: string, linkUrl?: string, linkLabel?: string) => {
+    setToast({ type, message, linkUrl, linkLabel });
+  }, []);
+
+  const checkOllama = useCallback(async () => {
+    setOllamaStatus(null); // trigger checking state
+    const url = providerSettings.ollamaBaseUrl || 'http://127.0.0.1:11434';
+    const status = await checkOllamaConnection(url);
+    setOllamaStatus(status);
+  }, [providerSettings.ollamaBaseUrl]);
+
+  const handleOllamaUrlSave = async () => {
+    const trimmed = ollamaBaseUrlInput.trim() || 'http://127.0.0.1:11434';
+    const newSettings = { ...providerSettings, ollamaBaseUrl: trimmed };
+    await saveSettings(newSettings);
+    setProviderSettings(newSettings);
+    showToast('success', 'Ollama Base URL saved');
+    checkOllama();
+  };
+
+  useEffect(() => {
+    if (settingsTab === 'ollama') {
+      checkOllama();
+    }
+  }, [settingsTab, checkOllama]);
+
+  useEffect(() => {
+    setOllamaBaseUrlInput(providerSettings.ollamaBaseUrl || 'http://127.0.0.1:11434');
+  }, [providerSettings.ollamaBaseUrl]);
   const hasHydratedMemoryRef = useRef(false);
   const dailyBackupInFlightRef = useRef(false);
   const lastAutoSavedAssistantIdRef = useRef<string | null>(null);
@@ -231,6 +277,7 @@ export default function App() {
         setProviderSettings(settings);
         setSettingsTab(settings.selectedProvider);
         setCustomModelInputs(settings.selectedModels);
+        setOllamaBaseUrlInput(settings.ollamaBaseUrl ?? DEFAULT_PROVIDER_SETTINGS.ollamaBaseUrl ?? 'http://127.0.0.1:11434');
         setGoogleSettingsState(storedGoogleSettings);
         setGoogleClientIdInput(storedGoogleSettings.clientId);
         setGoogleClientSecretInput(storedGoogleSettings.clientSecret ?? '');
@@ -243,7 +290,7 @@ export default function App() {
         setActivityStore(storedActivityStore);
         hasHydratedMemoryRef.current = true;
         const activeKey = settings.apiKeys[settings.selectedProvider];
-        if (!activeKey) setView('settings');
+        if (settings.selectedProvider !== 'ollama' && !activeKey) setView('settings');
       }
     );
     chrome.storage.local.get(['fallbackSettings'], (res) => {
@@ -351,7 +398,13 @@ export default function App() {
 
       if (message.type === 'FALLBACK_SWITCH') {
         const { from, to } = message.payload as { from: string; to: string };
-        setToast({ type: 'warning', message: `Rate limit on ${from}. Switching to ${to}...` });
+        setToast({
+          type: 'warning',
+          message:
+            from === 'ollama'
+              ? `Ollama is not running. Falling back to ${to}...`
+              : `Rate limit on ${from}. Switching to ${to}...`,
+        });
       }
     };
 
@@ -390,7 +443,7 @@ export default function App() {
     async (prompt: string): Promise<string> => {
       const { selectedProvider, apiKeys, selectedModels } = providerSettings;
       const apiKey = apiKeys[selectedProvider];
-      if (!apiKey) {
+      if (selectedProvider !== 'ollama' && !apiKey) {
         throw new Error('Add an API key before running memory summarization.');
       }
 
@@ -404,6 +457,7 @@ export default function App() {
                 provider: selectedProvider,
                 apiKey,
                 model: selectedModels[selectedProvider],
+                  baseUrl: selectedProvider === 'ollama' ? providerSettings.ollamaBaseUrl : undefined,
               },
             },
           },
@@ -501,76 +555,14 @@ export default function App() {
     void handleRegenerateEmailDraft('Use a more casual and conversational tone while keeping it professional and concise.');
   }, [handleRegenerateEmailDraft]);
 
-  const summarizeCurrentConversationToMemory = useCallback(async () => {
-    if (!memorySettings.autoSummarize || messages.length < 2) return;
-
-    setIsMemoryBusy(true);
-    try {
-      const summaryRaw = await runUtilityPrompt(buildConversationSummaryPrompt(messages));
-      const preferenceRaw = await runUtilityPrompt(buildPreferenceExtractionPrompt(messages));
-
-      const preferenceCandidates = parsePreferenceCandidates(preferenceRaw);
-      const nextMemory = createMemoryRecord({
-        snapshot: {
-          messages,
-          pageUrl: pageContext?.url,
-          pageTitle: pageContext?.title,
-        },
-        summary: summaryRaw,
-        preferenceCandidates,
-      });
-
-      const nextMemories = applyMemoryLimits([nextMemory, ...memoryStore.memories], memorySettings);
-      const nextPreferences = mergePreferences(memoryStore.preferences, preferenceCandidates, nextMemory.id);
-      const nextStore: MemoryStore = {
-        memories: nextMemories,
-        preferences: nextPreferences,
-      };
-
-      await saveMemoryStore(nextStore);
-      setMemoryStore(nextStore);
-      setToast({ type: 'success', message: 'Conversation saved to memory.' });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to summarize conversation memory.';
-      setToast({ type: 'error', message });
-    } finally {
-      setIsMemoryBusy(false);
-    }
-  }, [memorySettings.autoSummarize, messages, runUtilityPrompt, pageContext, memoryStore, memorySettings]);
+  const summarizeCurrentConversationToMemory = useCallback(async () => {}, []);
 
   const handleStartNewChat = useCallback(async () => {
-    const lastAssistant = [...messages].reverse().find((message) => message.role === 'assistant');
-    if (messages.length > 1 && (!memorySettings.autoSummarize || lastAutoSavedAssistantIdRef.current !== lastAssistant?.id)) {
-      await summarizeCurrentConversationToMemory();
-    }
     setMessages([]);
     setLoadedMemoryCount(0);
     setLastPromptMemoryContext(null);
     lastAutoSavedAssistantIdRef.current = null;
-  }, [messages, memorySettings.autoSummarize, summarizeCurrentConversationToMemory]);
-
-  useEffect(() => {
-    if (!memorySettings.autoSummarize || isLoading || isMemoryBusy || messages.length < 2) return;
-
-    const lastAssistant = [...messages].reverse().find((message) => message.role === 'assistant');
-    if (!lastAssistant || !lastAssistant.content.trim()) return;
-    if (lastAutoSavedAssistantIdRef.current === lastAssistant.id) return;
-
-    let cancelled = false;
-
-    const saveCurrentChat = async () => {
-      await summarizeCurrentConversationToMemory();
-      if (!cancelled) {
-        lastAutoSavedAssistantIdRef.current = lastAssistant.id;
-      }
-    };
-
-    void saveCurrentChat();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [isLoading, isMemoryBusy, messages, memorySettings.autoSummarize, summarizeCurrentConversationToMemory]);
+  }, []);
 
   const handleSend = useCallback(
     (overrideText?: string, overridePageContext?: PageContext) => {
@@ -582,7 +574,7 @@ export default function App() {
       const { selectedProvider, apiKeys, selectedModels } = providerSettings;
       const apiKey = apiKeys[selectedProvider];
 
-      if (!apiKey) {
+      if (selectedProvider !== 'ollama' && !apiKey) {
         isSendingRef.current = false;
         setView('settings');
         return;
@@ -607,11 +599,8 @@ export default function App() {
       }));
 
       const activePageContext = overridePageContext ?? pageContext;
-      const queryText = [text, activePageContext?.title ?? '', activePageContext?.url ?? ''].join(' ').trim();
-      const relevantMemories = searchMemories(queryText, memoryStore.memories, 3);
-      const promptMemoryContext = buildPromptMemoryContext(relevantMemories, memoryStore.preferences);
-      setLoadedMemoryCount(relevantMemories.length);
-      setLastPromptMemoryContext(promptMemoryContext);
+      setLoadedMemoryCount(0);
+      setLastPromptMemoryContext(null);
 
       const messageId = generateId();
       streamingMsgIdRef.current = messageId;
@@ -631,9 +620,10 @@ export default function App() {
               provider: selectedProvider,
               apiKey,
               model: selectedModels[selectedProvider],
+              baseUrl: selectedProvider === 'ollama' ? providerSettings.ollamaBaseUrl : undefined,
             },
             messageId,
-            memoryContext: promptMemoryContext,
+            memoryContext: null,
           },
         },
         (response) => {
@@ -678,6 +668,20 @@ export default function App() {
   }, [handleSend, pageContext, readActivePageContext]);
 
   // ── settings handlers ──
+
+  const handleCustomModelAdd = async (provider: LLMProvider) => {
+    const customModel = customModelInputs[provider].trim();
+    if (!customModel) return;
+
+    const newSettings = {
+      ...providerSettings,
+      selectedModels: { ...providerSettings.selectedModels, [provider]: customModel },
+    };
+    await saveSettings(newSettings);
+    setProviderSettings(newSettings);
+    setCustomModelInputs({ ...customModelInputs, [provider]: '' });
+    showToast('success', `${PROVIDER_META[provider].label} model set to ${customModel}.`);
+  };
 
   const handleKeyInput = (provider: LLMProvider, value: string) => {
     setKeyInputs((prev) => ({ ...prev, [provider]: value }));
@@ -863,7 +867,7 @@ export default function App() {
   const handleExtractJobForSheet = async () => {
     const { selectedProvider, apiKeys } = providerSettings;
     const apiKey = apiKeys[selectedProvider];
-    if (!apiKey) {
+    if (selectedProvider !== 'ollama' && !apiKey) {
       setView('settings');
       setToast({ type: 'error', message: 'Add an LLM API key before extracting job details.' });
       return;
@@ -1277,7 +1281,6 @@ export default function App() {
     <div className="flex gap-1 rounded-xl bg-gray-100 p-1">
       {([
         { id: 'chat', label: 'Chat' },
-        { id: 'memory', label: 'Memory' },
         { id: 'settings', label: 'Settings' },
       ] as const).map((tab) => (
         <button
@@ -1333,6 +1336,9 @@ export default function App() {
               <span className="text-white text-sm font-bold">J</span>
             </div>
             <span className="text-sm font-semibold text-gray-900">JobBuddy AI</span>
+            <span className="text-xs font-medium px-2 py-0.5 rounded-full bg-gray-100 text-gray-700" title="Total applications recorded">
+              Applications {jobHuntSummary.applications.total}
+            </span>
           </div>
           {renderTopTabs()}
         </header>
@@ -1390,6 +1396,133 @@ export default function App() {
             const draftKey = keyInputs[p];
             const isKeyVisible = keyVisible === p;
             const selectedModel = providerSettings.selectedModels[p];
+
+            if (p === 'ollama') {
+              return (
+                <div key={p} className="space-y-4">
+                  {/* Active indicator */}
+                  {isCurrentlyActive ? (
+                    <div className="flex items-center justify-between text-xs text-green-700 bg-green-50 border border-green-200 rounded-lg px-3 py-2">
+                      <div className="flex items-center gap-1.5">
+                        <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                        </svg>
+                        <span className="font-medium">Currently active provider</span>
+                      </div>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => void handleActivateProvider(p)}
+                      className="w-full text-xs font-medium text-blue-700 bg-blue-50 border border-blue-200 hover:bg-blue-100 rounded-lg px-3 py-2 transition-colors text-left"
+                    >
+                      Switch to Ollama →
+                    </button>
+                  )}
+
+                  {/* Settings section */}
+                  <div className="bg-white border rounded-lg p-3 space-y-4">
+                    {/* Status indicator */}
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <div className={`w-2.5 h-2.5 rounded-full ${ollamaStatus?.connected ? 'bg-green-500' : 'bg-red-500'}`}></div>
+                        <span className="text-xs font-medium text-gray-700">
+                          {ollamaStatus ? ollamaStatus.message : 'Checking connection...'}
+                        </span>
+                      </div>
+                      <button
+                        onClick={() => void checkOllama()}
+                        className="text-xs text-blue-600 hover:text-blue-800 transition-colors"
+                      >
+                        Test Connection
+                      </button>
+                    </div>
+
+                    {/* Optional URL */}
+                    <div>
+                      <label className="text-xs font-medium text-gray-700 block mb-1.5">Base URL</label>
+                      <div className="flex gap-2">
+                        <input
+                          type="text"
+                          value={ollamaBaseUrlInput}
+                          onChange={(e) => setOllamaBaseUrlInput(e.target.value)}
+                          onKeyDown={(e) => e.key === 'Enter' && void handleOllamaUrlSave()}
+                          placeholder="http://localhost:11434"
+                          className="flex-1 text-xs border border-gray-200 rounded-lg px-3 py-2 outline-none focus:border-blue-400 focus:ring-1 focus:ring-blue-400 transition-all"
+                        />
+                        <button
+                          onClick={() => void handleOllamaUrlSave()}
+                          className="px-3 py-2 text-xs font-medium bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-all"
+                        >
+                          Save
+                        </button>
+                      </div>
+                      <p className="mt-1 text-[11px] text-gray-500">Change only if running Ollama on a different port.</p>
+                    </div>
+
+                    {/* Model */}
+                    <div>
+                      <label className="text-xs font-medium text-gray-700 block mb-1.5">Model</label>
+                      <select
+                        value={selectedModel}
+                        onChange={(e) => void handleModelChange(p, e.target.value)}
+                        disabled={!ollamaStatus?.connected}
+                        className="w-full text-xs border border-gray-200 rounded-lg px-3 py-2 outline-none focus:border-blue-400 focus:ring-1 focus:ring-blue-400 bg-white transition-all disabled:bg-gray-50 disabled:text-gray-400"
+                      >
+                         <optgroup label="-- Recommended --">
+                           {meta.models.map((m) => (
+                             <option key={m.id} value={m.id}>{m.name}</option>
+                           ))}
+                         </optgroup>
+                         {ollamaStatus?.connected && ollamaStatus.models.length > 0 && (
+                           <optgroup label="-- Other Installed Models --">
+                             {ollamaStatus.models
+                               .filter(m => !meta.models.some(dm => dm.id === m))
+                               .map((m) => (
+                               <option key={m} value={m}>{m}</option>
+                             ))}
+                           </optgroup>
+                         )}
+                      </select>
+                      
+                      <div className="mt-2 flex gap-2">
+                        <input
+                          type="text"
+                          value={customModelInputs[p]}
+                          onChange={(e) =>
+                            setCustomModelInputs({ ...customModelInputs, [p]: e.target.value })
+                          }
+                          onKeyDown={(e) =>
+                            e.key === 'Enter' &&
+                            customModelInputs[p].trim() &&
+                            void handleCustomModelAdd(p)
+                          }
+                          placeholder="Type custom model name..."
+                          disabled={!ollamaStatus?.connected}
+                          className="flex-1 text-xs border border-gray-200 rounded-lg px-3 py-2 outline-none focus:border-blue-400 focus:ring-1 focus:ring-blue-400 transition-all disabled:bg-gray-50"
+                        />
+                        <button
+                          onClick={() => void handleCustomModelAdd(p)}
+                          disabled={!ollamaStatus?.connected || !customModelInputs[p].trim()}
+                          className={`px-3 py-1 text-xs rounded-md transition-all ${
+                            !ollamaStatus?.connected || !customModelInputs[p].trim()
+                              ? 'bg-gray-100 text-gray-400'
+                              : 'bg-white border text-gray-700 hover:bg-gray-50'
+                          }`}
+                        >
+                          Use
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="text-xs text-gray-500 bg-gray-50 rounded-lg p-3 space-y-1">
+                    <p className="font-medium text-gray-700">Free, unlimited, offline. No API key needed.</p>
+                    <p>Install from <a href="https://ollama.com" target="_blank" className="text-blue-600 hover:underline">ollama.com</a>. Pull models with:</p>
+                    <code className="block bg-gray-200 px-2 py-1 rounded mt-1">ollama pull qwen2.5:14b</code>
+                  </div>
+                </div>
+              );
+            }
 
             return (
               <div key={p} className="space-y-4">
@@ -1698,57 +1831,6 @@ export default function App() {
             </p>
           </section>
 
-          <section className="mt-6 border-t border-gray-200 pt-5 space-y-3">
-            <div>
-              <h3 className="text-xs font-semibold text-gray-900">Memory Settings</h3>
-              <p className="text-xs text-gray-500 mt-1">
-                Controls how conversation memory is summarized and retained.
-              </p>
-            </div>
-
-            <label className="inline-flex items-center gap-2 text-xs text-gray-700">
-              <input
-                type="checkbox"
-                checked={memorySettings.autoSummarize}
-                onChange={(e) => void handleUpdateMemorySettings({ ...memorySettings, autoSummarize: e.target.checked })}
-                className="h-3.5 w-3.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-              />
-              Auto-summarize conversations on New Chat
-            </label>
-
-            <div className="grid grid-cols-2 gap-2">
-              <label className="block">
-                <span className="mb-1 block text-xs font-medium text-gray-700">Max Memories</span>
-                <input
-                  type="number"
-                  min={50}
-                  max={1000}
-                  value={memorySettings.maxMemories}
-                  onChange={(e) => {
-                    const maxMemories = Math.max(50, Math.min(1000, Number(e.target.value) || 50));
-                    void handleUpdateMemorySettings({ ...memorySettings, maxMemories });
-                  }}
-                  className="w-full rounded-lg border border-gray-200 px-3 py-2 text-xs outline-none focus:border-blue-400 focus:ring-1 focus:ring-blue-400"
-                />
-              </label>
-
-              <label className="block">
-                <span className="mb-1 block text-xs font-medium text-gray-700">Retention Days</span>
-                <input
-                  type="number"
-                  min={30}
-                  max={365}
-                  value={memorySettings.retentionDays}
-                  onChange={(e) => {
-                    const retentionDays = Math.max(30, Math.min(365, Number(e.target.value) || 30));
-                    void handleUpdateMemorySettings({ ...memorySettings, retentionDays });
-                  }}
-                  className="w-full rounded-lg border border-gray-200 px-3 py-2 text-xs outline-none focus:border-blue-400 focus:ring-1 focus:ring-blue-400"
-                />
-              </label>
-            </div>
-          </section>
-
           {/* Auto-Fallback */}
           <section className="mt-6 rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
             <h3 className="text-sm font-semibold text-gray-900">Auto-Fallback</h3>
@@ -1809,48 +1891,6 @@ export default function App() {
     );
   }
 
-  if (view === 'memory') {
-    return (
-      <div className="flex flex-col h-full bg-white">
-        <header className="px-4 py-3 border-b border-gray-200 shadow-sm flex-shrink-0 space-y-2">
-          <div className="flex items-center gap-2">
-            <div className="w-7 h-7 rounded-lg bg-blue-600 flex items-center justify-center">
-              <span className="text-white text-sm font-bold">J</span>
-            </div>
-            <span className="text-sm font-semibold text-gray-900">JobBuddy AI</span>
-          </div>
-          {renderTopTabs()}
-        </header>
-
-        <MemoryPanel
-          memories={memoryStore.memories}
-          preferences={memoryStore.preferences}
-          storageUsageBytes={estimateMemoryUsageBytes(memoryStore)}
-          maxMemories={memorySettings.maxMemories}
-          onDeleteMemory={(id) => void handleDeleteMemory(id)}
-          onClearAll={() => void handleClearAllMemories()}
-          onDeletePreference={(key, value) => void handleDeletePreference(key, value)}
-          onEditPreference={(oldKey, oldValue, next) => void handleEditPreference(oldKey, oldValue, next)}
-          onExportBackup={handleExportMemoryBackup}
-          onImportBackup={handleImportMemoryBackup}
-          onCopyBackup={() => void handleCopyMemoryBackup()}
-          lastBackupDate={lastDailyBackupDate}
-          jobHuntSummary={jobHuntSummary}
-        />
-
-        <input
-          ref={memoryBackupInputRef}
-          type="file"
-          accept="application/json"
-          className="hidden"
-          onChange={(event) => void handleMemoryBackupFileChange(event)}
-        />
-
-        {renderToast()}
-      </div>
-    );
-  }
-
   // ─────────────────────────────────────────────────────────────────────────────
   //  Chat View
   // ─────────────────────────────────────────────────────────────────────────────
@@ -1871,30 +1911,26 @@ export default function App() {
             >
               {activeMeta.label}
             </span>
+            <span className="text-xs font-medium px-2 py-0.5 rounded-full bg-gray-100 text-gray-700" title="Total applications recorded">
+              Applications {jobHuntSummary.applications.total}
+            </span>
           </div>
 
           <button
             onClick={() => void handleStartNewChat()}
-            disabled={isMemoryBusy || isLoading}
+            disabled={isLoading}
             className={`rounded-lg border px-2.5 py-1 text-[11px] font-medium ${
-              isMemoryBusy || isLoading
+              isLoading
                 ? 'border-gray-200 bg-gray-100 text-gray-400 cursor-not-allowed'
                 : 'border-gray-200 bg-white text-gray-600 hover:bg-gray-50'
             }`}
-            title="Summarize this conversation (if enabled) and start a fresh chat"
+            title="Start a fresh chat"
           >
-            {isMemoryBusy ? 'Saving...' : 'New Chat'}
+            New Chat
           </button>
         </div>
         {renderTopTabs()}
       </header>
-
-      {loadedMemoryCount > 0 && (
-        <div className="mx-3 mt-2 px-3 py-1.5 rounded-lg border border-blue-200 bg-blue-50 text-[11px] text-blue-700 flex-shrink-0">
-          {loadedMemoryCount} relevant memories loaded for this conversation.
-          {lastPromptMemoryContext?.learnedPreferences?.length ? ' Preferences applied.' : ''}
-        </div>
-      )}
 
       {/* Error banner */}
       {errorBanner && (
@@ -1944,7 +1980,7 @@ export default function App() {
         isLoading={isLoading}
         isReadingPage={isReadingPage}
         isExtractingJob={isExtractingJob}
-        canSaveToSheet={Boolean(pageContext) && googleAuthState.isConnected && Boolean(sheetsConfig.spreadsheetId)}
+        canSaveToSheet={Boolean(pageContext)}
       />
 
       <JobSaveModal

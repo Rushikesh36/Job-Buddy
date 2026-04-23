@@ -17,6 +17,54 @@ import { buildSystemPrompt } from '../config/system-prompt';
 import { MY_PROFILE } from '../lib/profile';
 import { getFallbackChain } from '../services/fallback-manager';
 
+const OLLAMA_HEADER_RULE_IDS = [910001, 910002] as const;
+
+async function ensureOllamaOriginHeaderIsRemoved(): Promise<void> {
+  try {
+    await chrome.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: [...OLLAMA_HEADER_RULE_IDS],
+      addRules: [
+        {
+          id: OLLAMA_HEADER_RULE_IDS[0],
+          priority: 1,
+          action: {
+            type: 'modifyHeaders',
+            requestHeaders: [{ header: 'Origin', operation: 'remove' }],
+          },
+          condition: {
+            urlFilter: '|http://127.0.0.1:11434/',
+            resourceTypes: ['xmlhttprequest'],
+          },
+        },
+        {
+          id: OLLAMA_HEADER_RULE_IDS[1],
+          priority: 1,
+          action: {
+            type: 'modifyHeaders',
+            requestHeaders: [{ header: 'Origin', operation: 'remove' }],
+          },
+          condition: {
+            urlFilter: '|http://localhost:11434/',
+            resourceTypes: ['xmlhttprequest'],
+          },
+        },
+      ],
+    });
+  } catch (error) {
+    console.warn('Failed to install Ollama request header rules', error);
+  }
+}
+
+void ensureOllamaOriginHeaderIsRemoved();
+
+chrome.runtime.onInstalled.addListener(() => {
+  void ensureOllamaOriginHeaderIsRemoved();
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  void ensureOllamaOriginHeaderIsRemoved();
+});
+
 // Open side panel when extension icon is clicked
 chrome.action.onClicked.addListener((tab) => {
   if (tab.id) {
@@ -429,7 +477,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const payload = message.payload as SendToLLMPayload;
     const { messages, pageContext, llmConfig, messageId, memoryContext } = payload;
 
-    const systemPrompt = buildSystemPrompt(MY_PROFILE, pageContext, memoryContext ?? null);
+    const systemPrompt = buildSystemPrompt(MY_PROFILE, pageContext);
 
     sendResponse({ messageId });
 
@@ -445,6 +493,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         apiKeys?: Record<LLMProvider, string>;
         selectedProvider?: LLMProvider;
         selectedModels?: Record<LLMProvider, string>;
+        ollamaBaseUrl?: string;
       }) ?? {};
 
       const providerSettingsForChain = {
@@ -471,6 +520,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           : (providerSettingsForChain.selectedModels[currentProvider] ?? '');
 
         const config: LLMConfig = { provider: currentProvider, apiKey, model };
+        if (currentProvider === 'ollama') {
+          config.baseUrl =
+            index === 0
+              ? llmConfig.baseUrl
+              : (rawProviderSettings.ollamaBaseUrl ?? llmConfig.baseUrl);
+        }
 
         streamLLMResponse(messages, systemPrompt, config, {
           onChunk: (text) => {

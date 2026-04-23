@@ -1,4 +1,4 @@
-import type { LLMProvider, ProviderSettings, FallbackSettings } from '../lib/types';
+import { DEFAULT_FALLBACK_SETTINGS, type LLMProvider, type ProviderSettings, type FallbackSettings } from '../lib/types';
 
 export function isRateLimitError(status: number, bodyText: string): boolean {
   if (status === 429) return true;
@@ -27,9 +27,12 @@ export function getFallbackChain(
   if (!fallbackSettings.enabled) return [activeProvider];
 
   const hasKey = (p: LLMProvider) => !!providerSettings.apiKeys[p]?.trim();
+  const orderedProviders = activeProvider === 'ollama'
+    ? DEFAULT_FALLBACK_SETTINGS.order
+    : fallbackSettings.order;
 
   // Start with active provider, then fallback order (skipping those without keys)
-  const rest = fallbackSettings.order.filter(
+  const rest = orderedProviders.filter(
     (p) => p !== activeProvider && hasKey(p),
   );
 
