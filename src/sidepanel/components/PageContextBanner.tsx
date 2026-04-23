@@ -1,13 +1,11 @@
 import type { PageContext } from '../../lib/types';
-import type { NUworksDetectionResult } from '../../types/scanner';
 
 interface PageContextBannerProps {
   pageContext: PageContext;
-  nuworksDetection?: NUworksDetectionResult | null;
   onClear: () => void;
 }
 
-export default function PageContextBanner({ pageContext, nuworksDetection, onClear }: PageContextBannerProps) {
+export default function PageContextBanner({ pageContext, onClear }: PageContextBannerProps) {
   let fallbackHost = pageContext.url;
   try {
     fallbackHost = new URL(pageContext.url).hostname;
@@ -20,10 +18,6 @@ export default function PageContextBanner({ pageContext, nuworksDetection, onCle
       ? pageContext.title.slice(0, 45) + '…'
       : pageContext.title
     : fallbackHost;
-
-  const nuworksStatus = nuworksDetection?.isNUworksPage
-    ? `NUworks (${nuworksDetection.platform})`
-    : null;
 
   return (
     <div className="flex items-center gap-2 px-3 py-1.5 bg-green-50 border border-green-200 rounded-lg text-xs text-green-800 mx-3 mb-2">
@@ -43,11 +37,6 @@ export default function PageContextBanner({ pageContext, nuworksDetection, onCle
         />
       </svg>
       <span className="flex-1 truncate font-medium">Page read · Ask me anything about {displayTitle}</span>
-      {nuworksStatus && (
-        <span className="rounded-full border border-emerald-200 bg-emerald-100 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-800">
-          {nuworksStatus}
-        </span>
-      )}
       <button
         onClick={onClear}
         title="Clear page context"

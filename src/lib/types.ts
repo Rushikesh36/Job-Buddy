@@ -1,11 +1,4 @@
 // Shared types for JobBuddy AI Chrome Extension
-import type {
-  NUworksDetectionResult,
-  NUworksEnrichJobsResult,
-  NUworksEnrichProgress,
-  NUworksPageExtractionResult,
-  NUworksScanProgress,
-} from '../types/scanner';
 
 export interface PageContext {
   url: string;
@@ -20,6 +13,7 @@ export interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
   timestamp: Date;
+  usedProvider?: LLMProvider;
 }
 
 // Generic message shape sent to any LLM (Claude, Gemini, OpenAI all accept role+content)
@@ -33,7 +27,7 @@ export type ClaudeMessage = LLMMessage;
 
 // ---- Multi-LLM types ----
 
-export type LLMProvider = 'claude' | 'gemini' | 'openai' | 'openrouter';
+export type LLMProvider = 'claude' | 'gemini' | 'openai' | 'openrouter' | 'groq';
 
 export interface LLMConfig {
   provider: LLMProvider;
@@ -96,11 +90,12 @@ export const DEFAULT_MODELS: Record<LLMProvider, string> = {
   gemini: 'gemini-2.5-flash',
   openai: 'gpt-4o',
   openrouter: 'meta-llama/llama-3.1-8b-instruct:free',
+  groq: 'llama-3.3-70b-versatile',
 };
 
 export const DEFAULT_PROVIDER_SETTINGS: ProviderSettings = {
   selectedProvider: 'claude',
-  apiKeys: { claude: '', gemini: '', openai: '', openrouter: '' },
+  apiKeys: { claude: '', gemini: '', openai: '', openrouter: '', groq: '' },
   selectedModels: { ...DEFAULT_MODELS },
 };
 
@@ -108,17 +103,12 @@ export const DEFAULT_PROVIDER_SETTINGS: ProviderSettings = {
 
 export type MessageType =
   | 'GET_PAGE_CONTENT'
-  | 'NUWORKS_DETECT_PAGE'
-  | 'NUWORKS_EXTRACT_CURRENT_PAGE'
-  | 'NUWORKS_SCAN_ALL_PAGES'
-  | 'NUWORKS_ENRICH_TOP_JOBS'
-  | 'SCAN_PROGRESS'
-  | 'ENRICH_PROGRESS'
   | 'PAGE_CONTENT_RESULT'
   | 'PAGE_CONTENT_ERROR'
   | 'SEND_TO_LLM'
   | 'EXTRACT_JOB_DATA'
   | 'RUN_LLM_UTILITY'
+  | 'FALLBACK_SWITCH'
   // keep backward-compat alias
   | 'SEND_TO_CLAUDE'
   | 'CLAUDE_STREAM_CHUNK'
@@ -129,58 +119,6 @@ export type MessageType =
 export interface ChromeMessage {
   type: MessageType;
   payload?: unknown;
-}
-
-export interface NUworksDetectPageResult {
-  success: boolean;
-  data?: NUworksDetectionResult;
-  error?: string;
-}
-
-export interface NUworksExtractCurrentPageResult {
-  success: boolean;
-  data?: NUworksPageExtractionResult;
-  error?: string;
-}
-
-export interface NUworksScanAllPagesResult {
-  success: boolean;
-  data?: NUworksPageExtractionResult;
-  error?: string;
-}
-
-export interface NUworksScanAllPagesPayload {
-  nativePostedDateFilter?: 'all' | '24h' | '7d';
-}
-
-export interface NUworksEnrichTopJobsPayload {
-  jobs: Array<{
-    title: string;
-    company: string;
-    location: string;
-    jobId: string;
-    postingDate: string;
-    deadline: string;
-    jobType: string;
-    description: string;
-    detailUrl: string;
-    rawText: string;
-  }>;
-  topN?: number;
-}
-
-export interface NUworksEnrichTopJobsResult {
-  success: boolean;
-  data?: NUworksEnrichJobsResult;
-  error?: string;
-}
-
-export interface ScanProgressPayload {
-  data: NUworksScanProgress;
-}
-
-export interface EnrichProgressPayload {
-  data: NUworksEnrichProgress;
 }
 
 export interface SendToLLMPayload {
@@ -228,3 +166,15 @@ export interface StreamErrorPayload {
   error: string;
   messageId: string;
 }
+
+export interface FallbackSettings {
+  enabled: boolean;
+  order: LLMProvider[];
+  showProviderLabel: boolean;
+}
+
+export const DEFAULT_FALLBACK_SETTINGS: FallbackSettings = {
+  enabled: true,
+  order: ['groq', 'gemini', 'openai', 'claude', 'openrouter'],
+  showProviderLabel: true,
+};

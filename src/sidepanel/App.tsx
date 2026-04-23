@@ -8,10 +8,10 @@ import type {
   ProviderSettings,
   GoogleAuthState,
   GoogleSettings,
-  ExtractJobDataResult,
   RunLLMUtilityResult,
+  FallbackSettings,
 } from '../lib/types';
-import { DEFAULT_PROVIDER_SETTINGS, DEFAULT_GOOGLE_AUTH_STATE, DEFAULT_GOOGLE_SETTINGS } from '../lib/types';
+import { DEFAULT_PROVIDER_SETTINGS, DEFAULT_GOOGLE_AUTH_STATE, DEFAULT_GOOGLE_SETTINGS, DEFAULT_FALLBACK_SETTINGS } from '../lib/types';
 import { PROVIDER_META } from '../lib/llm-api';
 import { MY_PROFILE } from '../lib/profile';
 import {
@@ -25,15 +25,13 @@ import {
 import {
   appendJobToSheet,
   createNewSpreadsheetWithSecret,
-  loadAppliedJobLookup,
   loadSheetsConfig,
   markJobAsEmailed,
   normalizeSpreadsheetId,
   saveSheetsConfig,
-  type AppliedJobLookup,
 } from '../services/sheets-service';
 import { buildJobHuntSummary, loadActivityStore, recordApplication, recordOutreach, saveActivityStore, type ActivityStore } from '../services/activity-service';
-import { buildJobExtractionPrompt, toJobDraft } from '../prompts/job-extractor';
+import { parseJobFromPage } from '../prompts/job-extractor';
 import type { JobData, SheetsConfig } from '../types/job';
 import { DEFAULT_SHEETS_CONFIG } from '../types/job';
 import { detectEmailDraft, extractEmailCandidates, saveGmailDraft, sendEmailViaGmail } from '../services/gmail-service';
@@ -61,40 +59,6 @@ import {
 } from '../services/memory-service';
 import type { MemorySettings, MemoryStore, PromptMemoryContext } from '../types/memory';
 import { DEFAULT_MEMORY_SETTINGS, DEFAULT_MEMORY_STORE } from '../types/memory';
-import type {
-  NUworksDetectionResult,
-  NUworksEnrichProgress,
-  NUworksPageExtractionResult,
-  RawJobListing,
-  NUworksScanProgress,
-  ScanCache,
-  ScoredJob,
-  ScoringProgress,
-} from '../types/scanner';
-import { SCANNER_DEBUG_MODE_STORAGE_KEY } from '../types/scanner';
-import { scoreJobsInBatches } from '../services/job-scorer';
-import {
-  buildScanCache,
-  getJobCacheKey,
-  loadScanCache,
-  markJobsByCache,
-  saveScanCache,
-} from '../services/scan-cache';
-import {
-  filterOutFullyProcessedJobs,
-  markJobsScanned,
-  markJobsShortlisted,
-} from '../services/processed-job-registry';
-import {
-  clearScannerShortlist,
-  loadScannerShortlist,
-  saveScannerShortlist,
-} from '../services/scanner-shortlist';
-import {
-  loadScannerState,
-  saveScannerState,
-  clearScannerState,
-} from '../services/scanner-state-persistence';
 import ChatWindow from './components/ChatWindow';
 import InputBar from './components/InputBar';
 import PageContextBanner from './components/PageContextBanner';
@@ -102,9 +66,8 @@ import GoogleConnectButton from './components/GoogleConnectButton';
 import JobSaveModal from './components/JobSaveModal';
 import EmailComposeModal from './components/EmailComposeModal';
 import MemoryPanel from './components/MemoryPanel';
-import ScannerTab from './components/scanner/ScannerTab';
 
-const PROVIDERS: LLMProvider[] = ['claude', 'gemini', 'openai', 'openrouter'];
+const PROVIDERS: LLMProvider[] = ['claude', 'gemini', 'openai', 'groq', 'openrouter'];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -141,309 +104,10 @@ function saveSettings(settings: ProviderSettings): Promise<void> {
   });
 }
 
-function loadScannerDebugMode(): Promise<boolean> {
-  return new Promise((resolve) => {
-    chrome.storage.local.get([SCANNER_DEBUG_MODE_STORAGE_KEY], (result) => {
-      resolve(Boolean(result[SCANNER_DEBUG_MODE_STORAGE_KEY]));
-    });
-  });
-}
-
-function saveScannerDebugMode(enabled: boolean): Promise<void> {
-  return new Promise((resolve) => {
-    chrome.storage.local.set({ [SCANNER_DEBUG_MODE_STORAGE_KEY]: enabled }, resolve);
-  });
-}
-
-function toScannerJobData(job: RawJobListing | ScoredJob, resumeVersion: string): JobData {
-  const scored = 'matchScore' in job;
-  const baseNotes = scored
-    ? [
-        `Scanner Match Score: ${job.matchScore}/10`,
-        `Match Reason: ${job.matchReason || 'N/A'}`,
-        `Matching Skills: ${(job.matchingSkills || []).join(', ') || 'N/A'}`,
-        `Missing Skills: ${(job.missingSkills || []).join(', ') || 'N/A'}`,
-        `Visa Flag: ${job.visaFlag || 'yellow'}`,
-      ].join(' | ')
-    : 'Saved from NUworks scanner';
-
-  return {
-    dateApplied: new Date().toISOString(),
-    company: job.company || 'N/A',
-    role: job.title || 'N/A',
-    location: job.location || 'N/A',
-    jobId: job.jobId || 'N/A',
-    jobUrl: job.detailUrl || 'N/A',
-    keyRequirements: scored ? (job.matchingSkills || []).slice(0, 5) : [],
-    salaryRange: 'N/A',
-    visaSponsorship: 'Unknown',
-    atsScore: scored ? job.matchScore : 0,
-    resumeVersion,
-    status: 'Saved',
-    notes: baseNotes,
-  };
-}
-
-function toCsvValue(value: string): string {
-  const escaped = value.replace(/"/g, '""');
-  return `"${escaped}"`;
-}
-
-function exportScannerJobsCsv(jobs: Array<RawJobListing | ScoredJob>): void {
-  const headers = [
-    'Title',
-    'Company',
-    'Location',
-    'Job ID',
-    'Detail URL',
-    'Match Score',
-    'Match Reason',
-    'Matching Skills',
-    'Missing Skills',
-    'Visa Flag',
-    'Is New',
-  ];
-
-  const rows = jobs.map((job) => {
-    const scored = 'matchScore' in job;
-    return [
-      job.title || '',
-      job.company || '',
-      job.location || '',
-      job.jobId || '',
-      job.detailUrl || '',
-      scored ? String(job.matchScore) : '',
-      scored ? job.matchReason || '' : '',
-      scored ? (job.matchingSkills || []).join('; ') : '',
-      scored ? (job.missingSkills || []).join('; ') : '',
-      scored ? job.visaFlag || '' : '',
-      job.isNew ? 'YES' : 'NO',
-    ].map((value) => toCsvValue(value));
-  });
-
-  const csv = [headers.map((value) => toCsvValue(value)).join(','), ...rows.map((row) => row.join(','))].join('\n');
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement('a');
-  anchor.href = url;
-  anchor.download = `nuworks-scan-${new Date().toISOString().slice(0, 10)}.csv`;
-  anchor.click();
-  URL.revokeObjectURL(url);
-}
-
-function normalizeScannerLookupPart(value: string): string {
-  return value.trim().toLowerCase();
-}
-
-function normalizeUrlForLookup(value: string): string {
-  const raw = value.trim();
-  if (!raw) return '';
-
-  try {
-    const parsed = new URL(raw);
-    const normalizedPath = parsed.pathname.replace(/\/+$/, '');
-    return `${parsed.origin.toLowerCase()}${normalizedPath.toLowerCase()}`;
-  } catch {
-    return raw.toLowerCase().split('#')[0].split('?')[0].replace(/\/+$/, '');
-  }
-}
-
-function getScannerLookupKeys(job: RawJobListing | ScoredJob): string[] {
-  const keys: string[] = [];
-  const jobId = normalizeScannerLookupPart(job.jobId ?? '');
-  const detailUrl = normalizeScannerLookupPart(job.detailUrl ?? '');
-  const title = normalizeScannerLookupPart(job.title ?? '');
-  const company = normalizeScannerLookupPart(job.company ?? '');
-
-  if (jobId) keys.push(`id:${jobId}`);
-  if (detailUrl && detailUrl !== 'n/a') keys.push(`url:${detailUrl}`);
-  if (title && company) keys.push(`tc:${title}::${company}`);
-
-  return keys;
-}
-
-function isJobApplied(job: RawJobListing | ScoredJob, lookup: AppliedJobLookup): boolean {
-  const keys = getScannerLookupKeys(job);
-  return keys.some((key) => Boolean(lookup[key]));
-}
-
-function applyAppliedStatus<T extends RawJobListing | ScoredJob>(jobs: T[], lookup: AppliedJobLookup): T[] {
-  return jobs.map((job) => ({
-    ...job,
-    appliedStatus: isJobApplied(job, lookup) ? 'applied' : 'not-applied',
-  }));
-}
-
-type ScannerDateFilter = 'all' | '24h' | '3d' | '7d';
-const PROFILE_FIT_SCORE_THRESHOLD = 7;
-const PROFILE_FIT_RELAXED_SCORE_THRESHOLD = 5;
-const PROFILE_FIT_RELAXED_LIMIT = 10;
-const PROFILE_FIT_NON_RED_FALLBACK_LIMIT = 5;
-
-const SCANNER_HARD_EXCLUDE_PATTERNS: RegExp[] = [
-  /\bnot\s+qualified\b/i,
-  /\bus\s+citizen(ship)?\s+(required|only)\b/i,
-  /\bcitizens?\s+only\b/i,
-  /\bmust\s+be\s+(a\s+)?u\.?s\.?\s+citizen\b/i,
-  /\bunpaid\b/i,
-  /\bno\s+compensation\b/i,
-  /\bwithout\s+compensation\b/i,
-  /\bvolunteer\b/i,
-];
-
-function hasScannerHardExclusion(text: string): boolean {
-  if (!text) return false;
-  return SCANNER_HARD_EXCLUDE_PATTERNS.some((pattern) => pattern.test(text));
-}
-
-function filterJobsByEligibility<T extends RawJobListing | ScoredJob>(jobs: T[]): T[] {
-  return jobs.filter((job) => {
-    const combinedText = [
-      job.title,
-      job.company,
-      job.location,
-      job.postingDate,
-      job.deadline,
-      job.jobType,
-      job.description,
-      job.rawText,
-    ].filter(Boolean).join(' | ');
-
-    return !hasScannerHardExclusion(combinedText);
-  });
-}
-
-function isPaidJob(job: RawJobListing | ScoredJob): boolean {
-  const combinedText = [
-    job.title,
-    job.company,
-    job.location,
-    job.postingDate,
-    job.deadline,
-    job.jobType,
-    job.description,
-    job.rawText,
-  ].filter(Boolean).join(' | ');
-
-  return !hasScannerHardExclusion(combinedText);
-}
-
-function filterScoredByProfileFit(jobs: ScoredJob[]): ScoredJob[] {
-  const passed = jobs.filter((job) => job.matchScore >= PROFILE_FIT_SCORE_THRESHOLD && job.visaFlag !== 'red' && isPaidJob(job));
-  const filtered = jobs.length - passed.length;
-  if (filtered > 0) {
-    console.log(`[ProfileFit] Filtered out ${filtered} jobs:`);
-    jobs.forEach((job) => {
-      const scoreOk = job.matchScore >= PROFILE_FIT_SCORE_THRESHOLD;
-      const visaOk = job.visaFlag !== 'red';
-      const paidOk = isPaidJob(job);
-      if (!scoreOk || !visaOk || !paidOk) {
-        console.log(`  - ${job.company} / ${job.title}: score=${job.matchScore}(${scoreOk?'✓':'✗'}) visa=${job.visaFlag}(${visaOk?'✓':'✗'}) paid=${paidOk?'✓':'✗'}`);
-      }
-    });
-  }
-  return passed;
-}
-
-type ProfileFitSelectionMode = 'strict' | 'relaxed' | 'non-red-fallback';
-
-function selectProfileFitJobs(jobs: ScoredJob[]): { jobs: ScoredJob[]; mode: ProfileFitSelectionMode } {
-  const strict = filterScoredByProfileFit(jobs);
-  return { jobs: strict, mode: 'strict' };
-}
-
-function parseRelativeDate(text: string, nowMs: number): Date | null {
-  const value = text.toLowerCase();
-  if (/(just posted|today|posted today)/i.test(value)) return new Date(nowMs);
-  if (/(yesterday|posted yesterday)/i.test(value)) return new Date(nowMs - 24 * 60 * 60 * 1000);
-
-  // NUworks commonly renders compact ages like "1d", "2d", "12h".
-  const compactMatch = value.match(/\b(\d+)\s*(h|hr|hrs|d|w|m)\b/i);
-  if (compactMatch) {
-    const amount = Number.parseInt(compactMatch[1], 10);
-    const unit = compactMatch[2].toLowerCase();
-    if (Number.isFinite(amount)) {
-      if (unit === 'h' || unit === 'hr' || unit === 'hrs') {
-        return new Date(nowMs - amount * 60 * 60 * 1000);
-      }
-      if (unit === 'd') {
-        return new Date(nowMs - amount * 24 * 60 * 60 * 1000);
-      }
-      if (unit === 'w') {
-        return new Date(nowMs - amount * 7 * 24 * 60 * 60 * 1000);
-      }
-      if (unit === 'm') {
-        return new Date(nowMs - amount * 30 * 24 * 60 * 60 * 1000);
-      }
-    }
-  }
-
-  const hoursMatch = value.match(/(\d+)\s*(hour|hours|hr|hrs)\s*ago/i);
-  if (hoursMatch) {
-    const hours = Number.parseInt(hoursMatch[1], 10);
-    if (Number.isFinite(hours)) return new Date(nowMs - hours * 60 * 60 * 1000);
-  }
-
-  const daysMatch = value.match(/(\d+)\s*(day|days)\s*ago/i);
-  if (daysMatch) {
-    const days = Number.parseInt(daysMatch[1], 10);
-    if (Number.isFinite(days)) return new Date(nowMs - days * 24 * 60 * 60 * 1000);
-  }
-
-  return null;
-}
-
-function parseDateCandidate(value: string, nowMs: number): Date | null {
-  const raw = value.trim();
-  if (!raw) return null;
-
-  const direct = new Date(raw);
-  if (Number.isFinite(direct.getTime())) return direct;
-
-  return parseRelativeDate(raw, nowMs);
-}
-
-function extractPostingDate(job: RawJobListing | ScoredJob, nowMs: number): Date | null {
-  const posting = parseDateCandidate(job.postingDate, nowMs);
-  if (posting) return posting;
-
-  const textCandidates = [job.rawText, job.description].filter(Boolean);
-  for (const text of textCandidates) {
-    const postedHint = text.match(/(?:posted(?:\s+on)?|posting\s*date|date\s*posted)\s*[:\-]?\s*([^\n|,;]{3,40})/i);
-    if (postedHint?.[1]) {
-      const hinted = parseDateCandidate(postedHint[1], nowMs);
-      if (hinted) return hinted;
-    }
-
-    const relative = parseRelativeDate(text, nowMs);
-    if (relative) return relative;
-  }
-
-  return null;
-}
-
-function filterJobsByDate<T extends RawJobListing | ScoredJob>(jobs: T[], filter: ScannerDateFilter, nowMs = Date.now()): T[] {
-  const eligibleJobs = filterJobsByEligibility(jobs);
-  if (filter === 'all') return eligibleJobs;
-
-  const windowMs = filter === '24h'
-    ? 24 * 60 * 60 * 1000
-    : filter === '3d'
-      ? 3 * 24 * 60 * 60 * 1000
-      : 7 * 24 * 60 * 60 * 1000;
-
-  return eligibleJobs.filter((job) => {
-    const postedAt = extractPostingDate(job, nowMs);
-    if (!postedAt) return false;
-    const age = nowMs - postedAt.getTime();
-    return age <= windowMs;
-  });
-}
-
 // ─── App ──────────────────────────────────────────────────────────────────────
 
-type View = 'chat' | 'scanner' | 'memory' | 'settings';
-type ToastType = 'success' | 'error';
+type View = 'chat' | 'memory' | 'settings';
+type ToastType = 'success' | 'error' | 'warning';
 interface ToastState {
   type: ToastType;
   message: string;
@@ -453,7 +117,7 @@ interface ToastState {
 
 interface EmailGenerationSeed {
   userIntentText: string;
-  source: 'scanner' | 'manual' | 'chat';
+  source: 'manual' | 'chat';
   pageTitle?: string;
   pageUrl?: string;
   pageText?: string;
@@ -472,77 +136,10 @@ export default function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputValue, setInputValue] = useState('');
   const [pageContext, setPageContext] = useState<PageContext | null>(null);
-  const [nuworksDetection, setNuworksDetection] = useState<NUworksDetectionResult | null>(null);
-  const [nuworksCurrentPageJobs, setNuworksCurrentPageJobs] = useState<NUworksPageExtractionResult | null>(null);
-  const [nuworksScanProgress, setNuworksScanProgress] = useState<NUworksScanProgress | null>(null);
-  const [nuworksEnrichProgress, setNuworksEnrichProgress] = useState<NUworksEnrichProgress | null>(null);
-  const [nuworksScoredJobs, setNuworksScoredJobs] = useState<ScoredJob[]>([]);
-  const [scannerScoringProgress, setScannerScoringProgress] = useState<ScoringProgress | null>(null);
-  const [scanCache, setScanCache] = useState<ScanCache | null>(null);
-  const [scanNewOnly, setScanNewOnly] = useState(false);
-  const [showProfileFitOnly, setShowProfileFitOnly] = useState(true);
-  const [scannerDateFilter, setScannerDateFilter] = useState<ScannerDateFilter>('all');
-  const [newJobsCount, setNewJobsCount] = useState(0);
-  const [processedSkipCount, setProcessedSkipCount] = useState(0);
-  const [appliedJobLookup, setAppliedJobLookup] = useState<AppliedJobLookup>({});
-  const [profileFitPageIndex, setProfileFitPageIndex] = useState(0);
-  const [allJobsPageIndex, setAllJobsPageIndex] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
   const [isReadingPage, setIsReadingPage] = useState(false);
-  const [isScanningAllPages, setIsScanningAllPages] = useState(false);
-  const [isEnrichingJobs, setIsEnrichingJobs] = useState(false);
-  const [isScoringJobs, setIsScoringJobs] = useState(false);
-  const [isSavingScannerJobs, setIsSavingScannerJobs] = useState(false);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const [toast, setToast] = useState<ToastState | null>(null);
-  const [scannerDebugMode, setScannerDebugMode] = useState(false);
-  const scannerActionBusy = isScanningAllPages || isEnrichingJobs || isScoringJobs || isSavingScannerJobs;
-
-  const getDateFilteredJobs = useCallback(
-    <T extends RawJobListing | ScoredJob>(jobs: T[]): T[] => filterJobsByDate(jobs, scannerDateFilter),
-    [scannerDateFilter]
-  );
-
-  const currentPageJobsWithApplied = useMemo(() => {
-    if (!nuworksCurrentPageJobs) return null;
-    return {
-      ...nuworksCurrentPageJobs,
-      jobs: applyAppliedStatus(nuworksCurrentPageJobs.jobs, appliedJobLookup),
-    };
-  }, [nuworksCurrentPageJobs, appliedJobLookup]);
-
-  const scoredJobsWithApplied = useMemo(
-    () => applyAppliedStatus(nuworksScoredJobs, appliedJobLookup),
-    [nuworksScoredJobs, appliedJobLookup]
-  );
-
-  const filteredCurrentPageJobs = useMemo(() => {
-    if (!currentPageJobsWithApplied) return null;
-    return {
-      ...currentPageJobsWithApplied,
-      jobs: getDateFilteredJobs(currentPageJobsWithApplied.jobs),
-    };
-  }, [currentPageJobsWithApplied, getDateFilteredJobs]);
-
-  const allScoredJobs = useMemo(
-    () => getDateFilteredJobs(scoredJobsWithApplied),
-    [getDateFilteredJobs, scoredJobsWithApplied]
-  );
-
-  const profileFitJobs = useMemo(
-    () => selectProfileFitJobs(allScoredJobs).jobs,
-    [allScoredJobs]
-  );
-
-  // Monitor scored jobs state
-  useEffect(() => {
-    console.log('[State Monitor] Scored jobs state:', {
-      nuworksScoredJobs: nuworksScoredJobs.length,
-      allScoredJobs: allScoredJobs.length,
-      profileFitJobs: profileFitJobs.length,
-      dateFilter: scannerDateFilter,
-    });
-  }, [nuworksScoredJobs, allScoredJobs, profileFitJobs, scannerDateFilter]);
 
   // provider settings (persisted)
   const [providerSettings, setProviderSettings] = useState<ProviderSettings>(DEFAULT_PROVIDER_SETTINGS);
@@ -555,6 +152,7 @@ export default function App() {
     gemini: '',
     openai: '',
     openrouter: '',
+    groq: '',
   });
   const [keyVisible, setKeyVisible] = useState<LLMProvider | null>(null);
   const [customModelInputs, setCustomModelInputs] = useState<Record<LLMProvider, string>>({
@@ -562,6 +160,7 @@ export default function App() {
     gemini: '',
     openai: '',
     openrouter: '',
+    groq: '',
   });
   const [googleSettings, setGoogleSettingsState] = useState<GoogleSettings>(DEFAULT_GOOGLE_SETTINGS);
   const [googleClientIdInput, setGoogleClientIdInput] = useState('');
@@ -597,6 +196,7 @@ export default function App() {
   const [isMemoryBusy, setIsMemoryBusy] = useState(false);
   const [lastDailyBackupDate, setLastDailyBackupDate] = useState<string | null>(null);
   const [activityStore, setActivityStore] = useState<ActivityStore>({ days: [] });
+  const [fallbackSettings, setFallbackSettings] = useState<FallbackSettings>(DEFAULT_FALLBACK_SETTINGS);
   const memoryBackupInputRef = useRef<HTMLInputElement>(null);
   const hasHydratedMemoryRef = useRef(false);
   const dailyBackupInFlightRef = useRef(false);
@@ -605,26 +205,6 @@ export default function App() {
   const streamingMsgIdRef = useRef<string | null>(null);
   // Synchronous guard against double-sends before React re-renders with isLoading:true
   const isSendingRef = useRef(false);
-
-  const refreshAppliedJobLookup = useCallback(async () => {
-    const clientId = googleSettings.clientId.trim();
-    const spreadsheetId = sheetsConfig.spreadsheetId;
-    if (!googleAuthState.isConnected || !clientId || !spreadsheetId) {
-      setAppliedJobLookup({});
-      return;
-    }
-
-    try {
-      const lookup = await loadAppliedJobLookup({
-        clientId,
-        clientSecret: googleSettings.clientSecret,
-        spreadsheetId,
-      });
-      setAppliedJobLookup(lookup);
-    } catch {
-      setAppliedJobLookup({});
-    }
-  }, [googleAuthState.isConnected, googleSettings.clientId, googleSettings.clientSecret, sheetsConfig.spreadsheetId]);
 
   // ── on mount: load settings ──
   useEffect(() => {
@@ -637,7 +217,6 @@ export default function App() {
       loadMemorySettings(),
       getLastDailyMemoryBackupDate(),
       loadActivityStore(),
-      loadScannerDebugMode(),
     ]).then(
       ([
         settings,
@@ -648,7 +227,6 @@ export default function App() {
         storedMemorySettings,
         storedLastDailyBackupDate,
         storedActivityStore,
-        storedScannerDebugMode,
       ]) => {
         setProviderSettings(settings);
         setSettingsTab(settings.selectedProvider);
@@ -663,91 +241,15 @@ export default function App() {
         setMemorySettingsState(storedMemorySettings);
         setLastDailyBackupDate(storedLastDailyBackupDate);
         setActivityStore(storedActivityStore);
-        setScannerDebugMode(storedScannerDebugMode);
         hasHydratedMemoryRef.current = true;
         const activeKey = settings.apiKeys[settings.selectedProvider];
         if (!activeKey) setView('settings');
       }
     );
+    chrome.storage.local.get(['fallbackSettings'], (res) => {
+      if (res.fallbackSettings) setFallbackSettings(res.fallbackSettings as FallbackSettings);
+    });
   }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    const hydrateScannerState = async () => {
-      const [cached, shortlistCache, persistedState] = await Promise.all([
-        loadScanCache(),
-        loadScannerShortlist(),
-        loadScannerState(),
-      ]);
-      
-      if (!cancelled) {
-        setScanCache(cached);
-        
-        // Load persisted scanned and scored jobs
-        if (persistedState) {
-          if (persistedState.scannedJobs?.length) {
-            setNuworksCurrentPageJobs(
-              persistedState.currentPageExtraction || {
-                jobs: persistedState.scannedJobs,
-                diagnostics: {
-                  strategyUsed: 'structured',
-                  attemptedStrategies: ['structured'],
-                  structuredCandidates: persistedState.scannedJobs.length,
-                  textPatternCandidates: 0,
-                  deduplicatedCount: persistedState.scannedJobs.length,
-                  skippedEmptyTitleCount: 0,
-                },
-                llmFallbackInput: {
-                  pageUrl: 'restored',
-                  pageTitle: 'Restored Scanned Jobs',
-                  pageTextSample: '',
-                },
-                extractedAt: new Date().toISOString(),
-              }
-            );
-          }
-          
-          if (persistedState.scoredJobs?.length) {
-            setNuworksScoredJobs(persistedState.scoredJobs);
-          }
-        }
-        
-        // Also check shortlist cache for backwards compatibility
-        if (shortlistCache?.jobs?.length) {
-          void markJobsShortlisted(shortlistCache.jobs);
-          setNuworksScoredJobs(shortlistCache.jobs);
-          setNuworksCurrentPageJobs({
-            jobs: shortlistCache.jobs,
-            diagnostics: {
-              strategyUsed: 'structured',
-              attemptedStrategies: ['structured'],
-              structuredCandidates: shortlistCache.jobs.length,
-              textPatternCandidates: 0,
-              deduplicatedCount: shortlistCache.jobs.length,
-              skippedEmptyTitleCount: 0,
-            },
-            llmFallbackInput: {
-              pageUrl: shortlistCache.sourceUrl,
-              pageTitle: 'Saved Apply List',
-              pageTextSample: '',
-            },
-            extractedAt: shortlistCache.createdAt,
-          });
-        }
-      }
-    };
-
-    void hydrateScannerState();
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  useEffect(() => {
-    void refreshAppliedJobLookup();
-  }, [refreshAppliedJobLookup]);
 
   useEffect(() => {
     if (!hasHydratedMemoryRef.current) return;
@@ -847,16 +349,9 @@ export default function App() {
         });
       }
 
-      if (message.type === 'SCAN_PROGRESS') {
-        const payload = message.payload as { data?: NUworksScanProgress };
-        if (!payload?.data) return;
-        setNuworksScanProgress(payload.data);
-      }
-
-      if (message.type === 'ENRICH_PROGRESS') {
-        const payload = message.payload as { data?: NUworksEnrichProgress };
-        if (!payload?.data) return;
-        setNuworksEnrichProgress(payload.data);
+      if (message.type === 'FALLBACK_SWITCH') {
+        const { from, to } = message.payload as { from: string; to: string };
+        setToast({ type: 'warning', message: `Rate limit on ${from}. Switching to ${to}...` });
       }
     };
 
@@ -881,182 +376,15 @@ export default function App() {
   const handleReadPage = useCallback(async () => {
     setIsReadingPage(true);
     setErrorBanner(null);
-    setNuworksDetection(null);
-    setNuworksCurrentPageJobs(null);
-    setNuworksScoredJobs([]);
-    setScannerScoringProgress(null);
     try {
       const data = await readActivePageContext();
       setPageContext(data);
-
-      chrome.runtime.sendMessage({ type: 'NUWORKS_DETECT_PAGE' }, (detectionResponse) => {
-        if (chrome.runtime.lastError || !detectionResponse?.success) {
-          return;
-        }
-
-        const detection = detectionResponse.data as NUworksDetectionResult;
-        setNuworksDetection(detection);
-
-        if (!detection.isNUworksPage || !detection.isJobListingPage) {
-          return;
-        }
-
-        chrome.runtime.sendMessage({ type: 'NUWORKS_EXTRACT_CURRENT_PAGE' }, (extractResponse) => {
-          if (chrome.runtime.lastError || !extractResponse?.success) {
-            return;
-          }
-
-          const extraction = extractResponse.data as NUworksPageExtractionResult;
-          setNuworksCurrentPageJobs(extraction);
-
-          if (extraction.jobs.length > 0) {
-            setToast({
-              type: 'success',
-              message: `NUworks scan: found ${extraction.jobs.length} jobs on this page.`,
-            });
-          } else if (extraction.diagnostics.strategyUsed === 'llm-fallback-pending') {
-            setToast({
-              type: 'error',
-              message: 'No structured listings found on this page yet. LLM fallback will be used in the next step.',
-            });
-          }
-        });
-      });
     } catch (error) {
       setErrorBanner(error instanceof Error ? error.message : "Couldn't read this page.");
     } finally {
       setIsReadingPage(false);
     }
   }, [readActivePageContext]);
-
-  const handleScannerDebugModeToggle = useCallback(async (enabled: boolean) => {
-    setScannerDebugMode(enabled);
-    await saveScannerDebugMode(enabled);
-  }, []);
-
-  const handleScanNUworksAllPages = useCallback(() => {
-    if (scannerActionBusy) {
-      setToast({ type: 'error', message: 'Scanner is busy. Please wait for current operation to finish.' });
-      return;
-    }
-
-    setErrorBanner(null);
-    setNuworksCurrentPageJobs(null);
-    setNuworksScoredJobs([]);
-    setScannerScoringProgress(null);
-    setNewJobsCount(0);
-    setProcessedSkipCount(0);
-    setNuworksScanProgress({ page: 0, jobsFound: 0, totalPages: null });
-    setIsScanningAllPages(true);
-    void clearScannerShortlist();
-
-    chrome.runtime.sendMessage({ type: 'NUWORKS_DETECT_PAGE' }, (detectionResponse) => {
-      if (chrome.runtime.lastError || !detectionResponse?.success) {
-        setIsScanningAllPages(false);
-        setToast({
-          type: 'error',
-          message: detectionResponse?.error ?? chrome.runtime.lastError?.message ?? 'Failed to detect page.',
-        });
-        return;
-      }
-
-      const detection = detectionResponse.data as NUworksDetectionResult;
-      setNuworksDetection(detection);
-
-      if (!detection.isNUworksPage) {
-        setIsScanningAllPages(false);
-        setToast({ type: 'error', message: 'Open a NUworks page before scanning.' });
-        return;
-      }
-
-      const nativePostedDateFilter: 'all' | '24h' | '7d' = scannerDateFilter === '24h' || scannerDateFilter === '7d'
-        ? scannerDateFilter
-        : 'all';
-
-      chrome.runtime.sendMessage({
-        type: 'NUWORKS_SCAN_ALL_PAGES',
-        payload: { nativePostedDateFilter },
-      }, async (scanResponse) => {
-        setIsScanningAllPages(false);
-
-        if (chrome.runtime.lastError || !scanResponse?.success) {
-          setToast({
-            type: 'error',
-            message: scanResponse?.error ?? chrome.runtime.lastError?.message ?? 'NUworks scan failed.',
-          });
-          return;
-        }
-
-        const extraction = scanResponse.data as NUworksPageExtractionResult;
-        const { allJobs, newCount } = markJobsByCache(extraction.jobs, scanCache);
-        void markJobsScanned(allJobs);
-
-        const { jobs: unprocessedJobs, skippedCount } = await filterOutFullyProcessedJobs(allJobs);
-        const visibleJobs = scanNewOnly ? unprocessedJobs.filter((job) => job.isNew) : unprocessedJobs;
-
-        setNuworksCurrentPageJobs({
-          ...extraction,
-          jobs: visibleJobs,
-        });
-        setNewJobsCount(newCount);
-        setProcessedSkipCount(skippedCount);
-
-        const nextCache = buildScanCache(extraction.llmFallbackInput.pageUrl, allJobs);
-        setScanCache(nextCache);
-        void saveScanCache(nextCache);
-
-        // Persist scanner state
-        const extractionForStorage: NUworksPageExtractionResult = {
-          ...extraction,
-          jobs: visibleJobs,
-        };
-        void saveScannerState(visibleJobs, [], extractionForStorage);
-
-        const summaryTop = allJobs.slice(0, 3).map((job) => `${job.company || 'Unknown'} - ${job.title || 'Untitled'}`);
-        const summaryMemory = createMemoryRecord({
-          snapshot: {
-            messages: [],
-            pageUrl: extraction.llmFallbackInput.pageUrl,
-            pageTitle: extraction.llmFallbackInput.pageTitle,
-          },
-          summary: `Scanned NUworks on ${new Date().toLocaleString()}: ${allJobs.length} jobs found, ${newCount} new jobs. Top: ${summaryTop.join('; ') || 'N/A'}`,
-          preferenceCandidates: [],
-        });
-
-        const nextMemories = applyMemoryLimits([summaryMemory, ...memoryStore.memories], memorySettings);
-        const nextMemoryStore: MemoryStore = {
-          ...memoryStore,
-          memories: nextMemories,
-        };
-        void saveMemoryStore(nextMemoryStore);
-        setMemoryStore(nextMemoryStore);
-
-        if (visibleJobs.length > 0) {
-          const pagesScanned = extraction.diagnostics.pagesScanned ?? nuworksScanProgress?.page ?? 1;
-          const skippedText = skippedCount > 0 ? `, ${skippedCount} skipped as already processed` : '';
-          setToast({
-            type: 'success',
-            message: `NUworks scan complete: ${visibleJobs.length} jobs across ${pagesScanned} pages (${newCount} new${skippedText}).`,
-          });
-        } else {
-          if (skippedCount > 0) {
-            setToast({
-              type: 'success',
-              message: `All scanned jobs were already processed. Skipped ${skippedCount} jobs.`,
-            });
-            return;
-          }
-
-          setToast({
-            type: 'error',
-            message: scanNewOnly
-              ? 'No new jobs found since last scan. Disable Scan New Only to view all results.'
-              : 'Scan completed but no jobs were extracted. Try enabling Debug mode in Settings.',
-          });
-        }
-      });
-    });
-  }, [nuworksScanProgress?.page, scanCache, scanNewOnly, memoryStore, memorySettings, scannerActionBusy, scannerDateFilter]);
 
   const runUtilityPrompt = useCallback(
     async (prompt: string): Promise<string> => {
@@ -1172,470 +500,6 @@ export default function App() {
   const handleMakeEmailMoreCasual = useCallback(() => {
     void handleRegenerateEmailDraft('Use a more casual and conversational tone while keeping it professional and concise.');
   }, [handleRegenerateEmailDraft]);
-
-  const handleScoreCurrentPageJobs = useCallback(async () => {
-    console.log('[Scoring] Checking prerequisites...');
-    if (scannerActionBusy) {
-      setToast({ type: 'error', message: 'Scanner is busy. Please wait before scoring.' });
-      return;
-    }
-
-    if (!nuworksCurrentPageJobs) {
-      console.warn('[Scoring] nuworksCurrentPageJobs is null!');
-      setToast({ type: 'error', message: 'No scanned jobs found. Scan a page first.' });
-      return;
-    }
-
-    const jobs = getDateFilteredJobs(nuworksCurrentPageJobs?.jobs ?? []);
-    console.log(`[Scoring] After date filter: ${jobs.length} jobs (from ${nuworksCurrentPageJobs.jobs.length})`);
-    if (jobs.length === 0) {
-      setToast({
-        type: 'error',
-        message: scannerDateFilter === 'all'
-          ? 'Scan a NUworks listing page first.'
-          : 'No jobs match the selected date filter. Try All Dates or scan fresh results.',
-      });
-      return;
-    }
-
-    const { selectedProvider, apiKeys } = providerSettings;
-    if (!apiKeys[selectedProvider]) {
-      setView('settings');
-      setToast({ type: 'error', message: 'Add an API key before scoring jobs.' });
-      return;
-    }
-
-    setIsScoringJobs(true);
-    setNuworksScoredJobs([]);
-    setScannerScoringProgress({
-      scored: 0,
-      total: jobs.length,
-      batchIndex: 0,
-      totalBatches: Math.ceil(jobs.length / 10),
-    });
-
-    try {
-      console.log(`[Scoring] Starting to score ${jobs.length} jobs`);
-      const scored = await scoreJobsInBatches({
-        jobs,
-        candidateProfileText: JSON.stringify(MY_PROFILE, null, 2),
-        runPrompt: runUtilityPrompt,
-        onPartialResults: (partialScored) => setNuworksScoredJobs(partialScored),
-        onProgress: (progress) => setScannerScoringProgress(progress),
-      });
-
-      console.log(`[Scoring] Returned ${scored.length} scored jobs`);
-      scored.slice(0, 3).forEach((job, i) => {
-        console.log(`  Job ${i}: ${job.company} - ${job.title}, score=${job.matchScore}, visa=${job.visaFlag}`);
-      });
-
-      const { jobs: applyList, mode: profileFitMode } = selectProfileFitJobs(scored);
-      console.log(`[Scoring] Profile-fit filtering returned ${applyList.length} jobs with mode=${profileFitMode}`);
-      setNuworksScoredJobs(scored);
-
-      const scanUrl = nuworksCurrentPageJobs?.llmFallbackInput.pageUrl ?? pageContext?.url ?? window.location.href;
-      await saveScannerShortlist({
-        createdAt: new Date().toISOString(),
-        sourceUrl: scanUrl,
-        jobs: applyList,
-      });
-      await markJobsShortlisted(applyList);
-
-      // Persist scored jobs state
-      void saveScannerState(
-        nuworksCurrentPageJobs?.jobs ?? [],
-        scored,
-        nuworksCurrentPageJobs ?? null
-      );
-
-      const topPreview = applyList.slice(0, 5).map((job) => `${job.company || 'Unknown'} - ${job.title || 'Untitled'}`);
-      const shortlistMemory = createMemoryRecord({
-        snapshot: {
-          messages: [],
-          pageUrl: scanUrl,
-          pageTitle: nuworksCurrentPageJobs?.llmFallbackInput.pageTitle || 'NUworks Apply List',
-        },
-        summary: `Created apply-only shortlist: ${applyList.length} jobs kept after ranking. Preview: ${topPreview.join('; ') || 'N/A'}`,
-        preferenceCandidates: [],
-      });
-      const nextMemories = applyMemoryLimits([shortlistMemory, ...memoryStore.memories], memorySettings);
-      const nextMemoryStore: MemoryStore = {
-        ...memoryStore,
-        memories: nextMemories,
-      };
-      void saveMemoryStore(nextMemoryStore);
-      setMemoryStore(nextMemoryStore);
-
-      const modeText = profileFitMode === 'strict'
-        ? 'strict profile-fit criteria'
-        : profileFitMode === 'relaxed'
-          ? 'relaxed fallback criteria (score >= 5, non-red visa)'
-          : 'non-red fallback criteria';
-
-      const scoreBreakdown = {
-        total: scored.length,
-        scoreGte7: scored.filter(j => j.matchScore >= 7).length,
-        visaNotRed: scored.filter(j => j.visaFlag !== 'red').length,
-        paid: scored.filter(j => isPaidJob(j)).length,
-        profileFit: applyList.length,
-      };
-      
-      console.log('[Scoring] Final breakdown:', scoreBreakdown);
-
-      setToast({
-        type: 'success',
-        message: `Scored ${scored.length} jobs. Kept ${applyList.length} jobs using ${modeText}. (Score≥7: ${scoreBreakdown.scoreGte7}, Visa OK: ${scoreBreakdown.visaNotRed}, Paid: ${scoreBreakdown.paid})`,
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to score jobs.';
-      setToast({ type: 'error', message });
-    } finally {
-      setIsScoringJobs(false);
-    }
-  }, [
-    nuworksCurrentPageJobs,
-    providerSettings,
-    runUtilityPrompt,
-    scannerActionBusy,
-    getDateFilteredJobs,
-    scannerDateFilter,
-    pageContext?.url,
-    memoryStore,
-    memorySettings,
-  ]);
-
-  const handleEnrichTopJobs = useCallback(() => {
-    if (scannerActionBusy) {
-      setToast({ type: 'error', message: 'Scanner is busy. Please wait before enriching.' });
-      return;
-    }
-
-    const sourceJobs = nuworksScoredJobs.length > 0
-      ? getDateFilteredJobs(nuworksScoredJobs)
-      : getDateFilteredJobs(nuworksCurrentPageJobs?.jobs ?? []);
-
-    if (sourceJobs.length === 0) {
-      setToast({ type: 'error', message: 'Scan jobs first before enriching details.' });
-      return;
-    }
-
-    const total = sourceJobs.length;
-    setIsEnrichingJobs(true);
-    setNuworksEnrichProgress({ current: 0, total });
-
-    chrome.runtime.sendMessage(
-      {
-        type: 'NUWORKS_ENRICH_TOP_JOBS',
-        payload: {
-          jobs: sourceJobs,
-        },
-      },
-      (response) => {
-        setIsEnrichingJobs(false);
-
-        if (chrome.runtime.lastError || !response?.success || !response?.data?.jobs) {
-          setToast({
-            type: 'error',
-            message: response?.error ?? chrome.runtime.lastError?.message ?? 'Failed to enrich job details.',
-          });
-          return;
-        }
-
-        const enrichedJobs = response.data.jobs as NUworksPageExtractionResult['jobs'];
-
-        setNuworksCurrentPageJobs((prev) => {
-          if (!prev) return prev;
-          return {
-            ...prev,
-            jobs: enrichedJobs,
-            extractedAt: new Date().toISOString(),
-          };
-        });
-
-        setNuworksScoredJobs((prev) => {
-          if (prev.length === 0) return prev;
-
-          const byKey = new Map(enrichedJobs.map((job) => [getJobCacheKey(job), job]));
-          return prev.map((job) => {
-            const key = getJobCacheKey(job);
-            const enriched = byKey.get(key);
-            if (!enriched) return job;
-            return {
-              ...job,
-              description: enriched.description,
-              postingDate: enriched.postingDate,
-              deadline: enriched.deadline,
-              jobType: enriched.jobType,
-              rawText: enriched.rawText,
-            };
-          });
-        });
-
-        setToast({
-          type: 'success',
-          message: `Enrichment complete: ${response.data.enriched} of ${response.data.attempted} eligible jobs updated.`,
-        });
-      }
-    );
-  }, [nuworksCurrentPageJobs?.jobs, nuworksScoredJobs, scannerActionBusy, getDateFilteredJobs]);
-
-  const handleEnrichTest30Jobs = useCallback(() => {
-    if (scannerActionBusy) {
-      setToast({ type: 'error', message: 'Scanner is busy. Please wait before enriching.' });
-      return;
-    }
-
-    const sourceJobs = nuworksScoredJobs.length > 0
-      ? getDateFilteredJobs(nuworksScoredJobs)
-      : getDateFilteredJobs(nuworksCurrentPageJobs?.jobs ?? []);
-
-    if (sourceJobs.length === 0) {
-      setToast({ type: 'error', message: 'Scan jobs first before enriching details.' });
-      return;
-    }
-
-    // TEST: Take only first 30 jobs for comparison
-    const testJobs = sourceJobs.slice(0, 30);
-    const total = testJobs.length;
-    setIsEnrichingJobs(true);
-    setNuworksEnrichProgress({ current: 0, total });
-
-    chrome.runtime.sendMessage(
-      {
-        type: 'NUWORKS_ENRICH_TOP_JOBS',
-        payload: {
-          jobs: testJobs,
-        },
-      },
-      (response) => {
-        setIsEnrichingJobs(false);
-
-        if (chrome.runtime.lastError || !response?.success || !response?.data?.jobs) {
-          setToast({
-            type: 'error',
-            message: response?.error ?? chrome.runtime.lastError?.message ?? 'Failed to enrich job details.',
-          });
-          return;
-        }
-
-        const enrichedJobs = response.data.jobs as NUworksPageExtractionResult['jobs'];
-
-        setNuworksCurrentPageJobs((prev) => {
-          if (!prev) return prev;
-          return {
-            ...prev,
-            jobs: enrichedJobs,
-            extractedAt: new Date().toISOString(),
-          };
-        });
-
-        setNuworksScoredJobs((prev) => {
-          if (prev.length === 0) return prev;
-
-          const byKey = new Map(enrichedJobs.map((job) => [getJobCacheKey(job), job]));
-          return prev.map((job) => {
-            const key = getJobCacheKey(job);
-            const enriched = byKey.get(key);
-            if (!enriched) return job;
-            return {
-              ...job,
-              description: enriched.description,
-              postingDate: enriched.postingDate,
-              deadline: enriched.deadline,
-              jobType: enriched.jobType,
-              rawText: enriched.rawText,
-            };
-          });
-        });
-
-        setToast({
-          type: 'success',
-          message: `[TEST] Enrichment complete: ${response.data.enriched} of ${response.data.attempted} jobs enriched (first 30 only).`,
-        });
-      }
-    );
-  }, [nuworksCurrentPageJobs?.jobs, nuworksScoredJobs, scannerActionBusy, getDateFilteredJobs]);
-
-  const saveScannerJobToSheetInternal = useCallback(async (
-    job: RawJobListing | ScoredJob,
-    options: { showToast: boolean }
-  ): Promise<boolean> => {
-    if (!sheetsConfig.spreadsheetId) {
-      setView('settings');
-      if (options.showToast) {
-        setToast({ type: 'error', message: 'Set a Spreadsheet ID in Settings before saving scanner jobs.' });
-      }
-      return false;
-    }
-    if (!googleSettings.clientId.trim() || !googleAuthState.isConnected) {
-      setView('settings');
-      if (options.showToast) {
-        setToast({ type: 'error', message: 'Connect Google account before saving scanner jobs.' });
-      }
-      return false;
-    }
-
-    try {
-      const payload = toScannerJobData(job, sheetsConfig.resumeVersions[0] ?? 'default');
-      const result = await appendJobToSheet({
-        clientId: googleSettings.clientId,
-        clientSecret: googleSettings.clientSecret,
-        spreadsheetId: sheetsConfig.spreadsheetId,
-        jobData: payload,
-      });
-      if (options.showToast) {
-        setToast({
-          type: 'success',
-          message: 'Scanner job saved to Google Sheets.',
-          linkUrl: result.spreadsheetUrl,
-          linkLabel: 'Open Sheet',
-        });
-      }
-      return true;
-    } catch (error) {
-      if (options.showToast) {
-        const message = error instanceof Error ? error.message : 'Failed to save scanner job.';
-        setToast({ type: 'error', message });
-      }
-      return false;
-    }
-  }, [googleAuthState.isConnected, googleSettings.clientId, googleSettings.clientSecret, sheetsConfig.spreadsheetId, sheetsConfig.resumeVersions]);
-
-  const handleScannerSaveJobToSheet = useCallback(async (job: RawJobListing | ScoredJob) => {
-    if (scannerActionBusy) {
-      setToast({ type: 'error', message: 'Scanner is busy. Please wait before saving jobs.' });
-      return;
-    }
-
-    setIsSavingScannerJobs(true);
-    try {
-      await saveScannerJobToSheetInternal(job, { showToast: true });
-    } finally {
-      setIsSavingScannerJobs(false);
-    }
-  }, [saveScannerJobToSheetInternal, scannerActionBusy]);
-
-  const handleScannerSaveAllToSheet = useCallback(async () => {
-    if (scannerActionBusy) {
-      setToast({ type: 'error', message: 'Scanner is busy. Please wait before batch save.' });
-      return;
-    }
-
-    const sourceJobs = nuworksScoredJobs.length > 0
-      ? allScoredJobs
-      : getDateFilteredJobs(nuworksCurrentPageJobs?.jobs ?? []);
-    if (sourceJobs.length === 0) {
-      setToast({ type: 'error', message: 'No jobs available to save with current filters.' });
-      return;
-    }
-
-    setIsSavingScannerJobs(true);
-    let successCount = 0;
-    let failCount = 0;
-    try {
-      for (const job of sourceJobs) {
-        const ok = await saveScannerJobToSheetInternal(job, { showToast: false });
-        if (ok) {
-          successCount += 1;
-        } else {
-          failCount += 1;
-        }
-      }
-    } finally {
-      setIsSavingScannerJobs(false);
-    }
-
-    setToast({
-      type: successCount > 0 ? 'success' : 'error',
-      message: successCount > 0
-        ? `Saved ${successCount}/${sourceJobs.length} scanner jobs to Sheets${failCount > 0 ? ` (${failCount} failed)` : ''}.`
-        : 'Failed to save scanner jobs to Sheets.',
-    });
-  }, [nuworksScoredJobs, nuworksCurrentPageJobs?.jobs, saveScannerJobToSheetInternal, scannerActionBusy, getDateFilteredJobs, allScoredJobs]);
-
-  const handleScannerGenerateEmail = useCallback(async (job: RawJobListing | ScoredJob) => {
-    if (scannerActionBusy) {
-      setToast({ type: 'error', message: 'Scanner is busy. Please wait before generating email.' });
-      return;
-    }
-
-    if (!googleAuthState.isConnected || !googleSettings.clientId.trim()) {
-      setView('settings');
-      setToast({ type: 'error', message: 'Connect Google account first in Settings.' });
-      return;
-    }
-
-    try {
-      const seed: EmailGenerationSeed = {
-        userIntentText: `Write a cold email for the ${job.title || 'role'} at ${job.company || 'this company'}`,
-        source: 'scanner',
-        pageTitle: pageContext?.title,
-        pageUrl: job.detailUrl || pageContext?.url,
-        pageText: [job.description, job.rawText, pageContext?.textContent].filter(Boolean).join('\n\n'),
-        companyName: job.company,
-        roleTitle: job.title,
-        recipientCandidates: extractEmailCandidates([job.description, job.rawText, pageContext?.textContent].filter(Boolean).join('\n')),
-        chatContext: messages.slice(-6).map((m) => `${m.role}: ${m.content}`).join('\n'),
-        resumeVersion: sheetsConfig.resumeVersions[0] ?? 'default',
-      };
-      setEmailGenerationSeed(seed);
-
-      const generated = await runEmailGenerationFromSeed(seed, {
-        emailType: 'cold-recruiter',
-      });
-
-      setToast({
-        type: 'success',
-        message: `Generated ${generated.emailType.replace(/-/g, ' ')} email draft. Review and send.`,
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to generate smart email draft.';
-      setToast({ type: 'error', message });
-    }
-  }, [googleAuthState.isConnected, googleSettings.clientId, scannerActionBusy, pageContext?.title, pageContext?.url, pageContext?.textContent, messages, sheetsConfig.resumeVersions, runEmailGenerationFromSeed]);
-
-  const handleScannerChatAboutJob = useCallback((job: RawJobListing | ScoredJob) => {
-    if (scannerActionBusy) {
-      setToast({ type: 'error', message: 'Scanner is busy. Please wait before switching context.' });
-      return;
-    }
-
-    const text = [
-      `Job: ${job.title}`,
-      `Company: ${job.company}`,
-      `Location: ${job.location}`,
-      `Job URL: ${job.detailUrl}`,
-      `Description: ${job.description || job.rawText}`,
-    ].join('\n');
-
-    setPageContext({
-      url: job.detailUrl || 'https://nuworks.northeastern.edu',
-      title: `${job.title || 'Job'} @ ${job.company || 'Unknown Company'}`,
-      metaDescription: `NUworks scanner job context for ${job.title || 'job'}`,
-      textContent: text.slice(0, 15000),
-      extractedAt: new Date().toISOString(),
-    });
-    setView('chat');
-    setToast({ type: 'success', message: 'Loaded job context in Chat. Ask follow-up questions now.' });
-  }, [scannerActionBusy]);
-
-  const handleScannerExportCsv = useCallback(() => {
-    if (scannerActionBusy) {
-      setToast({ type: 'error', message: 'Scanner is busy. Please wait before exporting.' });
-      return;
-    }
-
-    const sourceJobs: Array<RawJobListing | ScoredJob> = nuworksScoredJobs.length > 0
-      ? allScoredJobs
-      : getDateFilteredJobs(nuworksCurrentPageJobs?.jobs ?? []);
-    if (sourceJobs.length === 0) {
-      setToast({ type: 'error', message: 'No scanner results to export yet.' });
-      return;
-    }
-
-    exportScannerJobsCsv(sourceJobs);
-    setToast({ type: 'success', message: `Exported ${sourceJobs.length} scanner results as CSV.` });
-  }, [nuworksCurrentPageJobs?.jobs, nuworksScoredJobs, scannerActionBusy, getDateFilteredJobs, allScoredJobs]);
 
   const summarizeCurrentConversationToMemory = useCallback(async () => {
     if (!memorySettings.autoSummarize || messages.length < 2) return;
@@ -1791,35 +655,10 @@ export default function App() {
   );
 
   const handleAnalyzeJob = useCallback(async () => {
-    const basePrompt = 'Analyze this job description and match it to my profile. Also tell me if I should reach out to a recruiter and whether I must tailor my resume before applying.';
-
-    const buildPromptWithCanonicalScore = (context: PageContext): string => {
-      const pageUrl = normalizeUrlForLookup(context.url ?? '');
-      const pageTitle = normalizeScannerLookupPart(context.title ?? '');
-
-      const matchedByUrl = pageUrl
-        ? nuworksScoredJobs.find((job) => normalizeUrlForLookup(job.detailUrl ?? '') === pageUrl)
-        : undefined;
-
-      const matchedByTitleCompany = pageTitle
-        ? nuworksScoredJobs.find((job) => {
-            const title = normalizeScannerLookupPart(job.title ?? '');
-            const company = normalizeScannerLookupPart(job.company ?? '');
-            if (!title || !company) return false;
-            return pageTitle.includes(title) || pageTitle.includes(company);
-          })
-        : undefined;
-
-      const matched = matchedByUrl ?? matchedByTitleCompany;
-      if (!matched) {
-        return `${basePrompt}\n\nIf you provide a numeric ATS/match score, use the SAME scoring standard as JobBuddy Scanner Score and Rank Jobs.`;
-      }
-
-      return `${basePrompt}\n\nUse this canonical scanner score (same standard as Score and Rank Jobs) as authoritative for this job:\n- Match Score: ${matched.matchScore}/10\n- Visa Flag: ${matched.visaFlag}\n- Match Reason: ${matched.matchReason || 'N/A'}\n\nIMPORTANT: Keep this exact score in your analysis. Do not output a different ATS/match score for this same job.`;
-    };
+    const prompt = 'Analyze this job description and match it to my profile. Also tell me if I should reach out to a recruiter and whether I must tailor my resume before applying.';
 
     if (pageContext) {
-      handleSend(buildPromptWithCanonicalScore(pageContext), pageContext);
+      handleSend(prompt, pageContext);
       return;
     }
 
@@ -1828,7 +667,7 @@ export default function App() {
       setErrorBanner(null);
       const data = await readActivePageContext();
       setPageContext(data);
-      handleSend(buildPromptWithCanonicalScore(data), data);
+      handleSend(prompt, data);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Read the page first before analyzing.';
       setErrorBanner(message);
@@ -1836,7 +675,7 @@ export default function App() {
     } finally {
       setIsReadingPage(false);
     }
-  }, [handleSend, pageContext, readActivePageContext, nuworksScoredJobs]);
+  }, [handleSend, pageContext, readActivePageContext]);
 
   // ── settings handlers ──
 
@@ -2022,7 +861,7 @@ export default function App() {
   };
 
   const handleExtractJobForSheet = async () => {
-    const { selectedProvider, apiKeys, selectedModels } = providerSettings;
+    const { selectedProvider, apiKeys } = providerSettings;
     const apiKey = apiKeys[selectedProvider];
     if (!apiKey) {
       setView('settings');
@@ -2046,37 +885,14 @@ export default function App() {
 
     setIsExtractingJob(true);
     try {
-      const prompt = buildJobExtractionPrompt(pageContext.textContent);
       const analysisText = [...messages]
         .reverse()
         .find((msg) => msg.role === 'assistant' && /ATS Match Score:/i.test(msg.content))?.content ?? '';
 
-      const response = await new Promise<{ success: boolean; data?: ExtractJobDataResult; error?: string }>((resolve) => {
-        chrome.runtime.sendMessage(
-          {
-            type: 'EXTRACT_JOB_DATA',
-            payload: {
-              prompt,
-              llmConfig: {
-                provider: selectedProvider,
-                apiKey,
-                model: selectedModels[selectedProvider],
-              },
-            },
-          },
-          (rawResponse) => {
-            resolve(rawResponse as { success: boolean; data?: ExtractJobDataResult; error?: string });
-          }
-        );
-      });
-
-      if (chrome.runtime.lastError || !response.success || !response.data?.content) {
-        throw new Error(response.error ?? chrome.runtime.lastError?.message ?? 'Failed to extract job details.');
-      }
-
-      const draft = toJobDraft({
-        extractedRaw: response.data.content,
-        jobUrl: pageContext.url,
+      const draft = parseJobFromPage({
+        text: pageContext.textContent,
+        url: pageContext.url,
+        pageTitle: pageContext.title,
         analysisText,
         resumeVersion: sheetsConfig.resumeVersions[0] ?? 'default',
       });
@@ -2262,7 +1078,6 @@ export default function App() {
       });
 
       if (updated) {
-        await refreshAppliedJobLookup();
         setToast({ type: 'success', message: 'Email sent and sheet row updated.' });
       }
     } catch {
@@ -2462,7 +1277,6 @@ export default function App() {
     <div className="flex gap-1 rounded-xl bg-gray-100 p-1">
       {([
         { id: 'chat', label: 'Chat' },
-        { id: 'scanner', label: 'Scanner' },
         { id: 'memory', label: 'Memory' },
         { id: 'settings', label: 'Settings' },
       ] as const).map((tab) => (
@@ -2478,6 +1292,33 @@ export default function App() {
       ))}
     </div>
   );
+
+  const renderToast = () =>
+    toast ? (
+      <div className="fixed top-3 right-3 z-50 max-w-[280px]">
+        <div
+          className={`rounded-lg border px-3 py-2 text-xs shadow-lg ${
+            toast.type === 'success'
+              ? 'border-green-200 bg-green-50 text-green-800'
+              : toast.type === 'warning'
+              ? 'border-amber-200 bg-amber-50 text-amber-800'
+              : 'border-red-200 bg-red-50 text-red-800'
+          }`}
+        >
+          <p>{toast.message}</p>
+          {toast.linkUrl && (
+            <a
+              href={toast.linkUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="mt-1 inline-block font-semibold underline"
+            >
+              {toast.linkLabel ?? 'Open'}
+            </a>
+          )}
+        </div>
+      </div>
+    ) : null;
 
   // ─────────────────────────────────────────────────────────────────────────────
   //  Settings View
@@ -2497,6 +1338,23 @@ export default function App() {
         </header>
 
         <div className="flex-1 overflow-y-auto px-4 py-4">
+          {/* Provider Status */}
+          <div className="mb-4 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2">
+            <p className="text-[11px] font-medium text-gray-700">
+              Providers ready:{' '}
+              {PROVIDERS.filter(p => providerSettings.apiKeys[p]?.trim()).map(p => (
+                <span key={p} className="ml-1 inline-flex items-center gap-0.5 text-emerald-600">
+                  <span className="text-[10px]">✓</span> {p}
+                </span>
+              ))}
+              {PROVIDERS.filter(p => !providerSettings.apiKeys[p]?.trim()).length > 0 && (
+                <span className="ml-2 text-gray-400">
+                  ({PROVIDERS.filter(p => !providerSettings.apiKeys[p]?.trim()).length} not configured)
+                </span>
+              )}
+            </p>
+          </div>
+
           {/* Provider tabs */}
           <p className="text-xs text-gray-500 mb-2">Select a provider to configure its API key:</p>
           <div className="flex gap-1.5 mb-4 p-1 bg-gray-100 rounded-xl">
@@ -2891,23 +1749,52 @@ export default function App() {
             </div>
           </section>
 
-          <section className="mt-6 border-t border-gray-200 pt-5 space-y-3">
-            <div>
-              <h3 className="text-xs font-semibold text-gray-900">Scanner Settings</h3>
-              <p className="text-xs text-gray-500 mt-1">
-                Enable debug logs while refining NUworks selectors and page detection.
-              </p>
-            </div>
-
-            <label className="inline-flex items-center gap-2 text-xs text-gray-700">
+          {/* Auto-Fallback */}
+          <section className="mt-6 rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
+            <h3 className="text-sm font-semibold text-gray-900">Auto-Fallback</h3>
+            <p className="mt-0.5 text-xs text-gray-500">
+              Automatically switch providers when rate limits are hit.
+            </p>
+            <label className="mt-3 flex items-center justify-between">
+              <span className="text-xs text-gray-700">Enable auto-fallback</span>
               <input
                 type="checkbox"
-                checked={scannerDebugMode}
-                onChange={(e) => void handleScannerDebugModeToggle(e.target.checked)}
-                className="h-3.5 w-3.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                checked={fallbackSettings.enabled}
+                onChange={(e) => {
+                  const next = { ...fallbackSettings, enabled: e.target.checked };
+                  setFallbackSettings(next);
+                  chrome.storage.local.set({ fallbackSettings: next });
+                }}
+                className="h-4 w-4 rounded border-gray-300 text-blue-600"
               />
-              Debug mode (log NUworks DOM signals to console)
             </label>
+            {fallbackSettings.enabled && (
+              <div className="mt-3">
+                <p className="text-[11px] font-medium text-gray-600">Fallback order (configured providers):</p>
+                <ol className="mt-1 space-y-1">
+                  {fallbackSettings.order
+                    .filter(p => providerSettings.apiKeys[p]?.trim())
+                    .map((p, i) => (
+                      <li key={p} className="text-[11px] text-gray-700">
+                        {i + 1}. {p.charAt(0).toUpperCase() + p.slice(1)}
+                      </li>
+                    ))}
+                </ol>
+                <label className="mt-2 flex items-center justify-between">
+                  <span className="text-xs text-gray-700">Show "via Provider" on fallback messages</span>
+                  <input
+                    type="checkbox"
+                    checked={fallbackSettings.showProviderLabel}
+                    onChange={(e) => {
+                      const next = { ...fallbackSettings, showProviderLabel: e.target.checked };
+                      setFallbackSettings(next);
+                      chrome.storage.local.set({ fallbackSettings: next });
+                    }}
+                    className="h-4 w-4 rounded border-gray-300 text-blue-600"
+                  />
+                </label>
+              </div>
+            )}
           </section>
 
           {/* Footer note */}
@@ -2917,29 +1804,7 @@ export default function App() {
           </p>
         </div>
 
-        {toast && (
-          <div className="fixed top-3 right-3 z-50 max-w-[280px]">
-            <div
-              className={`rounded-lg border px-3 py-2 text-xs shadow-lg ${
-                toast.type === 'success'
-                  ? 'border-green-200 bg-green-50 text-green-800'
-                  : 'border-red-200 bg-red-50 text-red-800'
-              }`}
-            >
-              <p>{toast.message}</p>
-              {toast.linkUrl && (
-                <a
-                  href={toast.linkUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="mt-1 inline-block font-semibold underline"
-                >
-                  {toast.linkLabel ?? 'Open'}
-                </a>
-              )}
-            </div>
-          </div>
-        )}
+        {renderToast()}
       </div>
     );
   }
@@ -2981,101 +1846,7 @@ export default function App() {
           onChange={(event) => void handleMemoryBackupFileChange(event)}
         />
 
-        {toast && (
-          <div className="fixed top-3 right-3 z-50 max-w-[280px]">
-            <div
-              className={`rounded-lg border px-3 py-2 text-xs shadow-lg ${
-                toast.type === 'success'
-                  ? 'border-green-200 bg-green-50 text-green-800'
-                  : 'border-red-200 bg-red-50 text-red-800'
-              }`}
-            >
-              <p>{toast.message}</p>
-              {toast.linkUrl && (
-                <a
-                  href={toast.linkUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="mt-1 inline-block font-semibold underline"
-                >
-                  {toast.linkLabel ?? 'Open'}
-                </a>
-              )}
-            </div>
-          </div>
-        )}
-      </div>
-    );
-  }
-
-  if (view === 'scanner') {
-    return (
-      <div className="flex flex-col h-full bg-white">
-        <header className="px-4 py-3 border-b border-gray-200 shadow-sm flex-shrink-0 space-y-2">
-          <div className="flex items-center gap-2">
-            <div className="w-7 h-7 rounded-lg bg-blue-600 flex items-center justify-center">
-              <span className="text-white text-sm font-bold">J</span>
-            </div>
-            <span className="text-sm font-semibold text-gray-900">JobBuddy AI</span>
-          </div>
-          {renderTopTabs()}
-        </header>
-
-        <ScannerTab
-          detection={nuworksDetection}
-          extraction={filteredCurrentPageJobs}
-          isScanning={isScanningAllPages}
-          scanProgress={nuworksScanProgress}
-          isEnriching={isEnrichingJobs}
-          enrichProgress={nuworksEnrichProgress}
-          isScoring={isScoringJobs}
-          scoringProgress={scannerScoringProgress}
-          scoredJobs={profileFitJobs}
-          allScoredJobs={allScoredJobs}
-          isBusy={scannerActionBusy}
-          scanNewOnly={scanNewOnly}
-          showProfileFitOnly={showProfileFitOnly}
-          dateFilter={scannerDateFilter}
-          newJobsCount={newJobsCount}
-          skippedProcessedCount={processedSkipCount}
-          lastScanDate={scanCache?.lastScanDate ?? null}
-          onToggleScanNewOnly={setScanNewOnly}
-          onToggleProfileFitOnly={setShowProfileFitOnly}
-          onDateFilterChange={setScannerDateFilter}
-          onScanCurrentPage={handleScanNUworksAllPages}
-          onEnrichTopJobs={handleEnrichTopJobs}
-          onEnrichTest30Jobs={handleEnrichTest30Jobs}
-          onScoreJobs={() => void handleScoreCurrentPageJobs()}
-          onSaveJobToSheet={(job) => void handleScannerSaveJobToSheet(job)}
-          onGenerateEmail={handleScannerGenerateEmail}
-          onChatAboutJob={handleScannerChatAboutJob}
-          onSaveAllToSheet={() => void handleScannerSaveAllToSheet()}
-          onExportCsv={handleScannerExportCsv}
-        />
-
-        {toast && (
-          <div className="fixed top-3 right-3 z-50 max-w-[280px]">
-            <div
-              className={`rounded-lg border px-3 py-2 text-xs shadow-lg ${
-                toast.type === 'success'
-                  ? 'border-green-200 bg-green-50 text-green-800'
-                  : 'border-red-200 bg-red-50 text-red-800'
-              }`}
-            >
-              <p>{toast.message}</p>
-              {toast.linkUrl && (
-                <a
-                  href={toast.linkUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="mt-1 inline-block font-semibold underline"
-                >
-                  {toast.linkLabel ?? 'Open'}
-                </a>
-              )}
-            </div>
-          </div>
-        )}
+        {renderToast()}
       </div>
     );
   }
@@ -3155,15 +1926,8 @@ export default function App() {
       {pageContext && (
         <PageContextBanner
           pageContext={pageContext}
-          nuworksDetection={nuworksDetection}
           onClear={() => {
             setPageContext(null);
-            setNuworksDetection(null);
-            setNuworksCurrentPageJobs(null);
-            setNuworksScanProgress(null);
-            setNuworksEnrichProgress(null);
-            setNuworksScoredJobs([]);
-            setScannerScoringProgress(null);
           }}
         />
       )}
@@ -3213,29 +1977,7 @@ export default function App() {
         onSaveDraft={() => void handleSaveEmailDraft()}
       />
 
-      {toast && (
-        <div className="fixed top-3 right-3 z-50 max-w-[280px]">
-          <div
-            className={`rounded-lg border px-3 py-2 text-xs shadow-lg ${
-              toast.type === 'success'
-                ? 'border-green-200 bg-green-50 text-green-800'
-                : 'border-red-200 bg-red-50 text-red-800'
-            }`}
-          >
-            <p>{toast.message}</p>
-            {toast.linkUrl && (
-              <a
-                href={toast.linkUrl}
-                target="_blank"
-                rel="noreferrer"
-                className="mt-1 inline-block font-semibold underline"
-              >
-                {toast.linkLabel ?? 'Open'}
-              </a>
-            )}
-          </div>
-        </div>
-      )}
+      {renderToast()}
     </div>
   );
 }

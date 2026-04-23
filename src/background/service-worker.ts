@@ -7,10 +7,15 @@ import type {
   ExtractJobDataResult,
   RunLLMUtilityPayload,
   RunLLMUtilityResult,
+  LLMProvider,
+  LLMConfig,
+  FallbackSettings,
 } from '../lib/types';
-import { streamLLMResponse } from '../lib/llm-api';
+import { DEFAULT_FALLBACK_SETTINGS } from '../lib/types';
+import { streamLLMResponse, isRateLimitErrorMessage } from '../lib/llm-api';
 import { buildSystemPrompt } from '../config/system-prompt';
 import { MY_PROFILE } from '../lib/profile';
+import { getFallbackChain } from '../services/fallback-manager';
 
 // Open side panel when extension icon is clicked
 chrome.action.onClicked.addListener((tab) => {
@@ -428,19 +433,74 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     sendResponse({ messageId });
 
-    streamLLMResponse(messages, systemPrompt, llmConfig, {
-      onChunk: (text) => {
-        const chunkPayload: StreamChunkPayload = { chunk: text, messageId };
-        chrome.runtime.sendMessage({ type: 'CLAUDE_STREAM_CHUNK', payload: chunkPayload }).catch(() => {});
-      },
-      onDone: () => {
-        const donePayload: StreamDonePayload = { messageId };
-        chrome.runtime.sendMessage({ type: 'CLAUDE_STREAM_DONE', payload: donePayload }).catch(() => {});
-      },
-      onError: (error) => {
-        const errPayload: StreamErrorPayload = { error, messageId };
-        chrome.runtime.sendMessage({ type: 'CLAUDE_STREAM_ERROR', payload: errPayload }).catch(() => {});
-      },
+    // Load fallback settings then run the chain
+    chrome.storage.local.get(['fallbackSettings', 'providerSettings'], (stored) => {
+      const fallbackSettings: FallbackSettings = {
+        ...DEFAULT_FALLBACK_SETTINGS,
+        ...((stored.fallbackSettings as Partial<FallbackSettings>) ?? {}),
+      };
+
+      // Build a minimal ProviderSettings shape just for key-checking in the fallback chain
+      const rawProviderSettings = (stored.providerSettings as {
+        apiKeys?: Record<LLMProvider, string>;
+        selectedProvider?: LLMProvider;
+        selectedModels?: Record<LLMProvider, string>;
+      }) ?? {};
+
+      const providerSettingsForChain = {
+        selectedProvider: rawProviderSettings.selectedProvider ?? llmConfig.provider,
+        apiKeys: rawProviderSettings.apiKeys ?? ({ [llmConfig.provider]: llmConfig.apiKey } as Record<LLMProvider, string>),
+        selectedModels: rawProviderSettings.selectedModels ?? ({ [llmConfig.provider]: llmConfig.model } as Record<LLMProvider, string>),
+      };
+
+      const chain = getFallbackChain(llmConfig.provider, providerSettingsForChain, fallbackSettings);
+
+      const tryNext = (index: number): void => {
+        if (index >= chain.length) {
+          const errPayload: StreamErrorPayload = { error: 'All providers exhausted. Please check your API keys and rate limits.', messageId };
+          chrome.runtime.sendMessage({ type: 'CLAUDE_STREAM_ERROR', payload: errPayload }).catch(() => {});
+          return;
+        }
+
+        const currentProvider = chain[index];
+        const apiKey = index === 0
+          ? llmConfig.apiKey
+          : (providerSettingsForChain.apiKeys[currentProvider] ?? '');
+        const model = index === 0
+          ? llmConfig.model
+          : (providerSettingsForChain.selectedModels[currentProvider] ?? '');
+
+        const config: LLMConfig = { provider: currentProvider, apiKey, model };
+
+        streamLLMResponse(messages, systemPrompt, config, {
+          onChunk: (text) => {
+            const chunkPayload: StreamChunkPayload = { chunk: text, messageId };
+            chrome.runtime.sendMessage({ type: 'CLAUDE_STREAM_CHUNK', payload: chunkPayload }).catch(() => {});
+          },
+          onDone: () => {
+            const donePayload: StreamDonePayload & { usedProvider?: LLMProvider } = { messageId };
+            if (currentProvider !== llmConfig.provider) {
+              donePayload.usedProvider = currentProvider;
+            }
+            chrome.runtime.sendMessage({ type: 'CLAUDE_STREAM_DONE', payload: donePayload }).catch(() => {});
+          },
+          onError: (error) => {
+            if (isRateLimitErrorMessage(error) && index < chain.length - 1) {
+              const nextProvider = chain[index + 1];
+              chrome.runtime.sendMessage({
+                type: 'FALLBACK_SWITCH',
+                payload: { from: currentProvider, to: nextProvider },
+              }).catch(() => {});
+              tryNext(index + 1);
+            } else {
+              const errPayload: StreamErrorPayload = { error, messageId };
+              chrome.runtime.sendMessage({ type: 'CLAUDE_STREAM_ERROR', payload: errPayload }).catch(() => {});
+            }
+          },
+        });
+      };
+
+      tryNext(0);
     });
 
     return true;

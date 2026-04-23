@@ -26,6 +26,24 @@ export interface ProviderMeta {
   hintUrl: string;
 }
 
+/** Returns true when an error string from a provider signals a rate limit. */
+export function isRateLimitErrorMessage(errorMsg: string): boolean {
+  const lower = errorMsg.toLowerCase();
+  const phrases = [
+    'rate limit',
+    'rate_limit',
+    'quota exceeded',
+    'resource exhausted',
+    'too many requests',
+    'requests per day',
+    'requests per minute',
+    'tokens per minute',
+    'overloaded',
+    'capacity',
+  ];
+  return phrases.some((p) => lower.includes(p));
+}
+
 export const PROVIDER_META: Record<LLMProvider, ProviderMeta> = {
   claude: {
     label: 'Claude',
@@ -68,6 +86,21 @@ export const PROVIDER_META: Record<LLMProvider, ProviderMeta> = {
     keyPlaceholder: 'sk-proj-…',
     keyGuide: 'platform.openai.com/api-keys',
     hintUrl: 'https://platform.openai.com/api-keys',
+  },
+  groq: {
+    label: 'Groq',
+    color: '#F55036',
+    models: [
+      { id: 'llama-3.3-70b-versatile',  name: 'Llama 3.3 70B' },
+      { id: 'llama-3.1-8b-instant',     name: 'Llama 3.1 8B (Fast)' },
+      { id: 'mixtral-8x7b-32768',       name: 'Mixtral 8x7B' },
+      { id: 'gemma2-9b-it',             name: 'Gemma 2 9B' },
+      { id: 'qwen-qwq-32b',             name: 'Qwen QwQ 32B' },
+    ],
+    defaultModel: 'llama-3.3-70b-versatile',
+    keyPlaceholder: 'gsk_…',
+    keyGuide: 'console.groq.com',
+    hintUrl: 'https://console.groq.com/keys',
   },
   openrouter: {
     label: 'OpenRouter',
@@ -283,7 +316,12 @@ async function streamOpenAI(
     ...messages.map((m) => ({ role: m.role, content: m.content })),
   ];
 
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+  const isGroq = config.provider === 'groq';
+  const baseUrl = isGroq
+    ? 'https://api.groq.com/openai/v1/chat/completions'
+    : 'https://api.openai.com/v1/chat/completions';
+
+  const response = await fetch(baseUrl, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -299,7 +337,8 @@ async function streamOpenAI(
 
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
-    callbacks.onError(handleHttpError(response.status, body, 'OpenAI'));
+    const providerName = isGroq ? 'Groq' : 'OpenAI';
+    callbacks.onError(handleHttpError(response.status, body, providerName));
     return;
   }
 
@@ -393,6 +432,7 @@ export async function streamLLMResponse(
         await streamGemini(messages, systemPrompt, config, callbacks);
         break;
       case 'openai':
+      case 'groq':
         await streamOpenAI(messages, systemPrompt, config, callbacks);
         break;
       case 'openrouter':
